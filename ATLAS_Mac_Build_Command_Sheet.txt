@@ -1,0 +1,107 @@
+ATLAS V2.0 - MAC DOWNLOAD / BUILD COMMAND SHEET
+================================================
+
+BEFORE GOING TO THE MAC
+-----------------------
+Put this file in the ROOT of your ATLAS Git repository:
+
+  ATLAS_Mac_Full_Setup_and_Build.sh
+
+Do not commit PEM keys, passwords, AWS credentials, catalog DB files, build/, dist/, or DMGs.
+
+
+OPTION 1 - CLONE USING GIT ON THE MAC
+-------------------------------------
+Open Terminal on the AWS Mac and type:
+
+mkdir -p ~/Projects
+cd ~/Projects
+git clone <YOUR-GIT-CLONE-URL>
+cd <YOUR-REPOSITORY-FOLDER>
+ls -la
+chmod +x ATLAS_Mac_Full_Setup_and_Build.sh
+./ATLAS_Mac_Full_Setup_and_Build.sh
+
+
+OPTION 2 - DOWNLOAD REPO ZIP USING SAFARI
+------------------------------------------
+1. In Safari, open your Git repository.
+2. Download the repository ZIP.
+3. Open Finder -> Downloads.
+4. Double-click the ZIP to extract it.
+5. Open Terminal and type:
+
+cd ~/Downloads
+ls
+cd <EXTRACTED-REPOSITORY-FOLDER>
+chmod +x ATLAS_Mac_Full_Setup_and_Build.sh
+./ATLAS_Mac_Full_Setup_and_Build.sh
+
+
+WHAT THE SCRIPT DOES
+--------------------
+- Validates ATLAS source files.
+- Checks Apple Command Line Tools.
+- Installs python.org Python 3.12.10 universal2 if needed.
+- Verifies Python contains arm64 + x86_64.
+- Creates requirements-mac.txt.
+- Makes launcher_desktop.py platform-aware.
+- Converts assets/icon.png into assets/ATLAS.icns.
+- Creates build-macos.spec with target_arch="universal2".
+- Creates .venv-mac and installs dependencies.
+- Builds dist/ATLAS.app.
+- Validates arm64 + x86_64.
+- Applies an ad-hoc signature for internal testing.
+- Creates ATLAS-V2.0-Universal.dmg.
+
+
+AFTER BUILD
+-----------
+Test the app:
+
+open dist/ATLAS.app
+
+Verify architecture:
+
+lipo -archs dist/ATLAS.app/Contents/MacOS/ATLAS
+
+Expected:
+
+x86_64 arm64
+
+Open the DMG:
+
+open ATLAS-V2.0-Universal.dmg
+
+
+OPTIONAL INTEL TEST ON APPLE SILICON
+------------------------------------
+softwareupdate --install-rosetta --agree-to-license
+arch -x86_64 dist/ATLAS.app/Contents/MacOS/ATLAS
+
+
+FUTURE BUILDS
+-------------
+cd ~/Projects/<YOUR-REPOSITORY-FOLDER>
+git pull
+./ATLAS_Mac_Full_Setup_and_Build.sh
+
+
+VNC / SSH SECURITY
+------------------
+Do not expose port 5900 publicly.
+Use SSH TCP 22 restricted to your approved public /32 address.
+For VNC, use the SSH tunnel from Windows:
+
+ssh -i "<YOUR-PEM-PATH>" -L 5900:localhost:5900 ec2-user@<ELASTIC-IP>
+
+Then RealVNC connects to:
+
+localhost:5900
+
+
+DISTRIBUTION NOTE
+-----------------
+This process makes an internal/testing DMG with an ad-hoc signature.
+For normal Gatekeeper-friendly distribution, do Developer ID signing,
+Apple notarization, stapling, and then the final DMG.
