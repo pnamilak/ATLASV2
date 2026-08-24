@@ -1,0 +1,6 @@
+mkdir -p ~/.aws
+
+cp ~/Downloads/credentials ~/.aws/credentials
+
+chmod 700 ~/.aws
+chmod 600 ~/.aws/credentials
