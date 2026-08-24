@@ -8,3 +8,17 @@ chmod 600 ~/.aws/credentials
 
 
 curl -sS "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o /tmp/AWSCLIV2.pkg && sudo installer -pkg /tmp/AWSCLIV2.pkg -target / && curl -sS "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/session-manager-plugin.pkg" -o /tmp/session-manager-plugin.pkg && sudo installer -pkg /tmp/session-manager-plugin.pkg -target / && aws --version && session-manager-plugin --version
+
+
+ec2-user@ip-172-25-18-236 ~ % mv .aws/credentials.txt .aws/credentials
+ec2-user@ip-172-25-18-236 ~ % chmod 600 ~/.aws/credentials
+ec2-user@ip-172-25-18-236 ~ % curl -sS "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o /tmp/AWSCLIV2.pkg && sudo installer -pkg /tmp/AWSCLIV2.pkg -target / && curl -sS "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/session-manager-plugin.pkg" -o /tmp/session-manager-plugin.pkg && sudo installer -pkg /tmp/session-manager-plugin.pkg -target / && aws --version && session-manager-plugin --version
+installer: Package name is AWS Command Line Interface
+installer: Installing at base path /
+installer: The install was successful.
+installer: Package name is session-manager-plugin
+installer: Installing at base path /
+installer: The install was successful.
+aws-cli/2.36.12 Python/3.14.6 Darwin/24.6.0 source/arm64
+zsh: command not found: session-manager-plugin
+ec2-user@ip-172-25-18-236 ~ % 
