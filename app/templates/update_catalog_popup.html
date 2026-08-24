@@ -1,0 +1,67 @@
+<div class="uc-head">
+  <div class="uc-head-left">
+    <div class="uc-title">Update Catalog</div>
+    <div class="uc-sub">
+      Live AWS refresh for the selected SSO profile (account-scoped). Builds inventory directly from AWS CLI
+      <span class="mono">describe-*</span> calls (no shared repo).
+    </div>
+    <div class="uc-meta small" id="uc_meta"></div>
+  </div>
+  <div id="uc_state_badge" class="badge text-bg-secondary">idle</div>
+</div>
+
+<!-- Filled by index.html JS before starting -->
+<input type="hidden" id="return_profile" value="">
+<input type="hidden" id="uc_profile_name" value="">
+<input type="hidden" id="uc_region" value="">
+
+<div class="uc-kv mt-3">
+  <div class="uc-kv-row">
+    <div class="uc-k">Profile</div>
+    <div class="uc-v mono" id="uc_profile_label">—</div>
+  </div>
+
+  <div class="uc-kv-row">
+    <div class="uc-k">Region</div>
+    <div class="uc-v mono" id="uc_region_label">—</div>
+  </div>
+
+  <div class="uc-kv-row">
+    <div class="uc-k">EC2 Ports</div>
+    <div class="uc-v">Linux → <span class="mono">22</span> • Windows → <span class="mono">3389</span></div>
+  </div>
+
+  <div class="uc-kv-row">
+    <div class="uc-k">What runs</div>
+    <div class="uc-v small text-secondary">
+      <div><span class="mono">ec2 describe-instances</span></div>
+      <div><span class="mono">rds describe-db-instances</span></div>
+      <div><span class="mono">rds describe-db-clusters</span> (Aurora)</div>
+    </div>
+  </div>
+
+  <div class="uc-kv-row">
+    <div class="uc-k">Outputs</div>
+    <div class="uc-v small text-secondary">
+      <div>• Exports a CSV (for troubleshooting / audit)</div>
+      <div>• Rebuilds <span class="mono">catalog.json</span> (used by UI)</div>
+      <div>• Rebuilds local <span class="mono">SQLite</span> DB for selected profile/region</div>
+    </div>
+  </div>
+</div>
+
+<div class="uc-log-wrap">
+  <div class="uc-log" id="uc_log">Ready.</div>
+</div>
+
+<div class="uc-actions">
+  <div class="uc-actions-left">
+    <button class="btn btn-sm btn-outline-light btn-glass" id="btnCopyLog" type="button">Copy Log</button>
+    <button class="btn btn-sm btn-outline-warning btn-glass" id="btnRunAgain" type="button">Run Again</button>
+  </div>
+  <div class="small" id="uc_hint"></div>
+</div>
+
+<div class="uc-footnote small">
+  Note: This refresh does not use any shared inventory repo. Users only see what their own SSO profile can access.
+</div>

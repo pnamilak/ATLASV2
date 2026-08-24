@@ -1,0 +1,2339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AWS Trusted Login & Access Service</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+<div class="app-bg"></div>
+<div class="atlas-toast-wrap" id="atlasToastWrap"></div>
+
+<nav class="topbar">
+  <div class="container-fluid topbar-inner">
+    <div class="brand">
+      <div class="brand-mark">ATL</div>
+      <div class="brand-text">
+        <div class="brand-title">AWS Trusted Login & Access Service <span class="atlas-version">V{{ app_version or "2.0.0" }}</span></div>
+
+        {% if mode == 'dashboard' %}
+          <div class="brand-subtitle">
+            Profile: <span class="mono">{{ selected_profile.name }}</span>
+            <span class="sep">•</span>
+            Region: <span class="mono">{{ selected_region }}</span>
+            <span class="sep">•</span>
+            Env: <span class="mono">{{ selected_profile.environment }}</span>
+          </div>
+        {% else %}
+          <div class="brand-subtitle">Choose a profile to browse DB endpoints and EC2 instances</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <a class="btn btn-sm btn-ghost" href="{{ url_for('index') }}">Profiles</a>
+
+      {% if mode != 'dashboard' %}
+        <form method="post" action="{{ url_for('sync_profiles') }}" class="d-inline">
+          <button type="submit" class="btn btn-sm btn-ghost">Sync AWS Profiles</button>
+        </form>
+      {% endif %}
+
+      {% if mode == 'dashboard' %}
+        <form method="get" action="{{ url_for('dashboard', profile_name=selected_profile.name) }}" class="d-inline">
+          <select name="region" class="form-select form-select-sm region-select"
+                  onchange="this.form.submit()">
+            {% for r in available_regions %}
+              <option value="{{ r }}" {% if r == selected_region %}selected{% endif %}>{{ r }}</option>
+            {% endfor %}
+          </select>
+        </form>
+        <form method="post"
+              action="{{ url_for('refresh_catalog', profile_name=selected_profile.name) }}"
+              class="d-inline">
+          <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+          <button type="submit" class="btn btn-sm btn-ghost">Refresh Catalog</button>
+        </form>
+        {% if catalog_info %}
+          <span class="catalog-freshness {{ 'is-fresh' if catalog_info.fresh else 'is-stale' }}"
+                title="{{ catalog_info.last_refresh_utc or 'Catalog refresh time unavailable' }}">
+            {{ catalog_info.status }} • {{ catalog_info.age_text }}
+          </span>
+        {% endif %}
+        <button type="button" class="btn btn-sm btn-ghost" id="btnDiagnostics">Diagnostics</button>
+        <button type="button"
+              class="btn btn-sm btn-ghost"
+              id="btnConnectionStatus">
+          Connection Status
+        </button>
+      {% endif %}
+    </div>
+  </div>
+</nav>
+
+<div class="container-fluid page">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="mt-3">
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }} py-2 mb-2 glass-alert" style="white-space:pre-wrap">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% if mode == 'profiles' %}
+    <div class="section">
+      <div class="section-title">Profiles</div>
+      <div class="section-subtitle">Loaded from <span class="mono">~/.aws/config</span> and <span class="mono">~/.aws/credentials</span></div>
+
+      <div class="cards">
+        {% for p in profiles %}
+          <div class="cardx glass">
+            <div class="cardx-head">
+              <div>
+                <div class="cardx-title">{{ p.name }}</div>
+                <div class="muted small">
+                  Env: <span class="mono">{{ p.environment }}</span>
+                  • Region: <span class="mono">{{ p.region }}</span>
+
+                  {% if p.account_id %}
+                    • Account: <span class="mono">{{ p.account_id }}</span>
+                  {% endif %}
+                </div>
+              </div>
+              <div class="pill">{{ p.auth_type }}</div>
+            </div>
+
+            <div class="cardx-body">
+              <div class="muted small">Credentials detected: <b>{{ "Yes" if p.has_credentials else "No" }}</b></div>
+              {% if p.is_sso %}
+                <div class="muted small mt-2">StartUrl: <span class="mono">{{ p.sso_start_url }}</span></div>
+                <div class="muted small">Role: <span class="mono">{{ p.role_name }}</span></div>
+              {% else %}
+                <div class="muted small mt-2">Non-SSO profile/access keys profile</div>
+              {% endif %}
+            </div>
+
+            <div class="cardx-actions">
+              {% if p.is_sso %}
+                <a class="btn btn-sm btn-glass btn-3d btn-sso"
+                  target="_blank"
+                  href="{{ url_for('sso_login', profile=p.name) }}">
+                  SSO Login
+                </a>
+              {% else %}
+                <a class="btn btn-sm btn-glass btn-open"
+                  target="_blank"
+                  href="{{ url_for('dashboard', profile_name=p.name) }}">
+                  Open
+                </a>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+
+      <div class="hint mt-3">
+        Tip: After SSO Login, inventory builds automatically. Then open dashboard and use SSM actions.
+      </div>
+    </div>
+
+  {% else %}
+
+    {% if update_job %}
+      <div class="jobbox glass-alert mt-3" id="jobBox" data-jobid="{{ update_job.job_id }}">
+        <div class="jobbox-head">
+          <div class="jobbox-title">
+            <span class="spinner" aria-hidden="true"></span>
+            Loading region inventory
+          </div>
+          <div class="muted small">
+            Status: <span class="mono" id="jobStatus">{{ update_job.status }}</span>
+            <span class="sep">•</span>
+            Last update: <span class="mono" id="jobLast">{{ update_job.last_update }}</span>
+          </div>
+        </div>
+
+        <div class="jobbox-body">
+          <div class="loadingline">
+            <span class="muted small">Loading instance details</span>
+            <span class="dots mono" id="dots">...</span>
+          </div>
+
+          <div class="progress-wrap">
+            <div class="progressbar">
+              <div class="progressbar-fill" id="pbFill" style="width: 6%"></div>
+            </div>
+            <div class="muted small mt-2">
+              Please wait… catalog is building in background.
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endif %}
+
+      <!-- Environment first + Technology second + Search -->
+      <div id="dashboardToolbar"
+           class="dashboard-toolbar glass mt-2 mb-3 view-pick-mode"
+           data-view-picker="1"
+           style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px;border-radius:16px;">
+        <div class="d-flex align-items-center gap-2 flex-wrap view-picker-row">
+          <label class="muted small mb-0 view-label">View:</label>
+          <select id="roleViewSelect"
+                  class="form-select form-select-sm region-select"
+                  style="width:190px;">
+            <option value="">-- Select View --</option>
+            <option value="ALL">ALL</option>
+            <option value="DBA">DBA / Database</option>
+            <option value="WEB">Web UI</option>
+            <option value="SHELL">EC2 / Shell</option>
+            <option value="JUMPBOX">Jumpbox</option>
+            <option value="FAVORITES">Favorites</option>
+          </select>
+          <label class="muted small mb-0">Environment:</label>
+          <select id="envFilterSelect"
+                  class="form-select form-select-sm region-select"
+                  style="width:180px;">
+            <option value="ALL">ALL</option>
+          </select>
+          <div class="muted small ms-1" id="envSummary"></div>
+        </div>
+
+        <div class="view-quick-cards" id="viewQuickCards" aria-label="Choose dashboard view">
+          <button type="button" class="view-card" data-role-view-card="DBA"><span class="view-card-icon">🗄️</span><span class="view-card-title">DBA / Database</span><span class="view-card-sub">RDS, DocDB, Redis</span></button>
+          <button type="button" class="view-card" data-role-view-card="WEB"><span class="view-card-icon">🌐</span><span class="view-card-title">Web UI</span><span class="view-card-sub">RabbitMQ, KPOW, Grafana/Prometheus, Kibana</span></button>
+          <button type="button" class="view-card" data-role-view-card="SHELL"><span class="view-card-icon">🖥️</span><span class="view-card-title">EC2 / Shell</span><span class="view-card-sub">Interactive SSM shell</span></button>
+          <button type="button" class="view-card" data-role-view-card="JUMPBOX"><span class="view-card-icon">🔐</span><span class="view-card-title">Jumpbox</span><span class="view-card-sub">Bastion access nodes</span></button>
+          <button type="button" class="view-card" data-role-view-card="FAVORITES"><span class="view-card-icon">⭐</span><span class="view-card-title">Favorites</span><span class="view-card-sub">Your pinned systems</span></button>
+        </div>
+
+        <div class="toolbar-search" style="min-width:280px;max-width:460px;width:100%;">
+          <input
+            type="text"
+            id="instanceSearch"
+            class="form-control"
+            placeholder="Search within selected environment..."
+            autocomplete="off">
+        </div>
+      </div>
+
+      <!-- Technology filters inside selected environment. No ALL tab. First available tech opens automatically. -->
+      <div class="tabs-row tech-filter-row mb-3" id="techFilterRow">
+        <button class="tabbtn fav-tab" data-tech-filter="FAVORITES">
+          <span class="dot"></span>
+          ⭐ Favorites
+        </button>
+        {% for tech in ["MSSQL","PostgreSQL","MySQL","Aurora","Other DB"] %}
+          {% if db_grouped.get(tech) %}
+            <button class="tabbtn" data-tech-filter="{{ tech|upper|replace(' ','') }}">
+              <span class="dot"></span>
+              {{ tech }}
+            </button>
+          {% endif %}
+        {% endfor %}
+
+        {% for tech in ["PostgreSQL Cluster","MySQL Cluster","Aurora Cluster","DocDB Cluster","Cluster"] %}
+          {% if db_grouped.get(tech) %}
+            <button class="tabbtn" data-tech-filter="{{ tech|upper|replace(' ','') }}">
+              <span class="dot"></span>
+              {{ tech }}
+            </button>
+          {% endif %}
+        {% endfor %}
+
+        <div class="tabs-break"></div>
+
+        <!-- Neo4j -->
+        {% if ec2_grouped.get("Neo4j Web URL") and ec2_grouped.get("Neo4j Web URL")|length > 0 %}
+          <button class="tabbtn" data-tech-filter="NEO4JWEBURL">
+            <span class="dot"></span>
+            Neo4j Web URL
+          </button>
+        {% endif %}
+
+        <!-- RabbitMQ -->
+        {% if ec2_grouped.get("RabbitMQ Web URL") and ec2_grouped.get("RabbitMQ Web URL")|length > 0 %}
+          <button class="tabbtn" data-tech-filter="RABBITMQWEBURL">
+            <span class="dot"></span>
+            RabbitMQ Web URL
+          </button>
+        {% endif %}
+
+        <!-- Other Web UI technologies -->
+        {% for tech in ["KPOW Web URL","Grafana/Prometheus Web URL","Kibana Web URL"] %}
+          {% if ec2_grouped.get(tech) and ec2_grouped.get(tech)|length > 0 %}
+            <button class="tabbtn" data-tech-filter="{{ tech|upper|replace(' ','') }}">
+              <span class="dot"></span>
+              {{ tech }}
+            </button>
+          {% endif %}
+        {% endfor %}
+
+        <!-- EC2 / infrastructure technologies -->
+        {% for tech in ["Redis","KES","Jumpbox","EC2"] %}
+          {% if ec2_grouped.get(tech) and ec2_grouped.get(tech)|length > 0 %}
+            <button class="tabbtn" data-tech-filter="{{ tech|upper|replace(' ','') }}">
+              <span class="dot"></span>
+              {{ tech }}
+            </button>
+          {% endif %}
+        {% endfor %}
+      </div>
+  
+    <!-- DB PANELS -->
+    {% for tech, envmap in db_grouped.items() %}
+      <div class="tech-section" id="db-{{ tech|replace(' ','') }}" data-tech="{{ tech|upper|replace(' ','') }}">
+        <div class="panel-head">
+          <div class="panel-title">{{ tech }} endpoints</div>
+          <div class="muted">Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        {% for env, items in envmap.items() %}
+          <div class="panel-head sub env-section" data-env-section="{{ env }}">
+            <div class="panel-title">{{ env }}</div>
+            <div class="muted">{{ items|length }} endpoints</div>
+          </div>
+
+          <div class="cards">
+            {% for it in items %}
+              {% set st = (it.status or 'unknown')|lower %}
+              {% set pill_class = 'pill-warn' %}
+              {% if st in ['available','running'] %}{% set pill_class = 'pill-ok' %}{% endif %}
+              {% if st in ['stopped','stopping','terminated','failed','deleting','deleted'] %}{% set pill_class = 'pill-bad' %}{% endif %}
+
+              <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="{{ tech|upper|replace(' ','') }}" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+                <div class="cardx-head">
+                  <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                  <div class="pill {{ pill_class }}">{{ it.status or 'unknown' }}</div>
+                </div>
+
+                <div class="cardx-body">
+                  {% if it.engine %}
+                    <div class="kv"><span class="k">Engine</span><span class="v mono">{{ it.engine }}</span></div>
+                  {% endif %}
+
+                  <div class="kv">
+                    <span class="k">Status</span>
+                    <span class="v mono status-text {% if st in ['available','running'] %}status-running{% elif st in ['stopped','stopping','terminated','failed','deleting','deleted'] %}status-stopped{% else %}status-unknown{% endif %}">
+                      {{ it.status or 'unknown' }}
+                    </span>
+                  </div>
+                  <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+
+                  {% if it.members and it.members|length > 0 %}
+                    <div class="kv">
+                      <span class="k">Instances</span>
+                      <span class="v mono">{{ it.members|length }} member(s)</span>
+                    </div>
+                  {% endif %}
+
+                    <div class="kv">
+                      <span class="k">Endpoint</span>
+                      <span class="v mono">
+                        {% if it.route53_records and it.route53_records|length > 0 %}
+                          {{ it.route53_records[0] }}
+                        {% else %}
+                          {{ it.endpoint }}
+                        {% endif %}
+                      </span>
+                    </div>
+
+                    {% if it.route53_records and it.route53_records|length > 0 %}
+                      <div class="kv">
+                        <span class="k">AWS Endpoint</span>
+                        <span class="v mono muted">{{ it.endpoint }}</span>
+                      </div>
+                    {% endif %}
+                  <div class="kv"><span class="k">Remote Port</span><span class="v mono">{{ it.remote_port }}</span></div>
+                  <div class="kv"><span class="k">Local Port</span><span class="v mono">{{ it.local_port }}</span></div>
+
+                  <!-- ✅ Jumpbox display + Change button -->
+                  <div class="kv">
+                    <span class="k">Jumpbox</span>
+                    <span class="v mono">
+                      <span class="jb-effective"
+                            data-profile="{{ selected_profile.name }}"
+                            data-region="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}"
+                            data-env="{{ it.env }}"
+                            data-target-type="{{ it.target_type }}">
+                        Loading...
+                      </span>
+                      <span class="muted small jb-source"></span>
+                    </span>
+                  </div>
+
+                  <div class="kv">
+                    <span class="k"></span>
+                    <span class="v">
+                      <button type="button"
+                              class="btn btn-sm btn-ghost jb-change"
+                              data-profile="{{ selected_profile.name }}"
+                              data-region="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}"
+                              data-env="{{ it.env }}"
+                              data-target-type="{{ it.target_type }}">
+                        Change Jumpbox
+                      </button>
+                    </span>
+                  </div>
+                  <!-- ✅ end jumpbox UI -->
+
+                </div>
+
+                <div class="cardx-actions">
+                  {% if it.members and it.members|length > 0 %}
+                    <a class="btn btn-sm btn-glass btn-3d btn-open"
+                       target="_blank"
+                       href="{{ url_for('cluster_members', profile=selected_profile.name, region=(it.region if it.region is defined and it.region else selected_region), cluster_id=it.aws_target, target_type=it.target_type, env=it.env) }}">
+                      Show Instances
+                    </a>
+                  {% endif %}
+
+                  <form method="post" action="{{ url_for('ssm_forward') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="target_type" value="{{ it.target_type }}">
+                    <input type="hidden" name="aws_target" value="{{ it.aws_target }}">
+                    <input type="hidden" name="remote_host" value="{{ it.endpoint }}">
+                    <input type="hidden" name="remote_port" value="{{ it.remote_port }}">
+                    <input type="hidden" name="local_port" value="{{ it.local_port }}">
+                    <input type="hidden" name="env" value="{{ it.env }}">
+                    <input type="hidden" name="can_forward" value="{{ 1 if it.can_forward else 0 }}">
+
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-ssm {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="DB is not available/running"{% endif %}>
+                      SSM Port Forward
+                    </button>
+                  </form>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% endfor %}
+      </div>
+    {% endfor %}
+
+    <!-- NEO4J WEB URL PANEL -->
+    {% if ec2_grouped.get("Neo4j Web URL") and ec2_grouped.get("Neo4j Web URL")|length > 0 %}
+      <div class="tech-section" id="ec2-Neo4jWebURL" data-tech="NEO4JWEBURL">
+        <div class="panel-head">
+          <div class="panel-title">Neo4j Web URL instances</div>
+          <div class="muted">Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        <div class="cards">
+          {% for it in ec2_grouped.get("Neo4j Web URL") %}
+              {% set st = (it.state or 'unknown')|lower %}
+              <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="NEO4JWEBURL" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+                <div class="cardx-head">
+                  <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                  <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                    {{ it.state or 'unknown' }}
+                  </div>
+                </div>
+
+                <div class="cardx-body">
+                  <div class="kv"><span class="k">Instance</span><span class="v mono">{{ it.instance_id }}</span></div>
+                  <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+                  <div class="kv"><span class="k">Web URL Remote Port</span><span class="v mono">8080</span></div>
+                  <div class="kv"><span class="k">Local Port</span><span class="v mono">{{ it.local_port }}</span></div>
+                </div>
+
+                <div class="cardx-actions">
+                  <form method="post" action="{{ url_for('webui_forward') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                    <input type="hidden" name="local_port" value="{{ it.local_port }}">
+                    <input type="hidden" name="remote_port" value="8080">
+                    <input type="hidden" name="web_type" value="neo4j">
+                    <input type="hidden" name="env" value="{{ it.env }}">
+                    <input type="hidden" name="can_forward" value="{{ 1 if it.can_forward else 0 }}">
+
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-ssm {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                      Open Neo4j Web URL
+                    </button>
+                  </form>
+
+                  <form method="post" action="{{ url_for('ssm_shell') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-open {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                      SSM Shell
+                    </button>
+                  </form>
+                </div>
+              </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- RABBITMQ WEB URL PANEL -->
+    {% if ec2_grouped.get("RabbitMQ Web URL") and ec2_grouped.get("RabbitMQ Web URL")|length > 0 %}
+      <div class="tech-section" id="ec2-RabbitMQWebURL" data-tech="RABBITMQWEBURL">
+        <div class="panel-head">
+          <div class="panel-title">RabbitMQ Web URL instances</div>
+          <div class="muted">Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        <div class="cards">
+          {% for it in ec2_grouped.get("RabbitMQ Web URL") %}
+              {% set st = (it.state or 'unknown')|lower %}
+              <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="RABBITMQWEBURL" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+                <div class="cardx-head">
+                  <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                  <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                    {{ it.state or 'unknown' }}
+                  </div>
+                </div>
+
+                <div class="cardx-body">
+                  <div class="kv"><span class="k">Instance</span><span class="v mono">{{ it.instance_id }}</span></div>
+                  <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+                  <div class="kv"><span class="k">Web URL Remote Port</span><span class="v mono">8080</span></div>
+                  <div class="kv"><span class="k">Local Port</span><span class="v mono">{{ it.local_port }}</span></div>
+                </div>
+
+                <div class="cardx-actions">
+                  <form method="post" action="{{ url_for('webui_forward') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                    <input type="hidden" name="local_port" value="{{ it.local_port }}">
+                    <input type="hidden" name="remote_port" value="8080">
+                    <input type="hidden" name="web_type" value="rabbitmq">
+                    <input type="hidden" name="env" value="{{ it.env }}">
+                    <input type="hidden" name="can_forward" value="{{ 1 if it.can_forward else 0 }}">
+
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-ssm {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                      Open RabbitMQ Web URL
+                    </button>
+                  </form>
+
+                  <form method="post" action="{{ url_for('ssm_shell') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-open {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                      SSM Shell
+                    </button>
+                  </form>
+                </div>
+              </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- LOG / OBSERVABILITY WEB URL PANELS -->
+    {% for web_group, web_port, web_label, web_type in [
+      ("KPOW Web URL", 2190, "KPOW", "kpow"),
+      ("Grafana/Prometheus Web URL", 3000, "Grafana/Prometheus", "grafana"),
+      ("Kibana Web URL", 8080, "Kibana", "kibana")
+    ] %}
+      {% if ec2_grouped.get(web_group) and ec2_grouped.get(web_group)|length > 0 %}
+        <div class="tech-section" id="ec2-{{ web_group|replace(' ','') }}" data-tech="{{ web_group|upper|replace(' ','') }}">
+          <div class="panel-head">
+            <div class="panel-title">{{ web_label }} Web URL instances</div>
+            <div class="muted">{{ ec2_grouped.get(web_group)|length }} instances • Region: <span class="mono">{{ selected_region }}</span></div>
+          </div>
+
+          <div class="cards">
+            {% for it in ec2_grouped.get(web_group) %}
+              {% set st = (it.state or 'unknown')|lower %}
+              <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="{{ web_group|upper|replace(' ','') }}" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+                <div class="cardx-head">
+                  <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                  <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                    {{ it.state or 'unknown' }}
+                  </div>
+                </div>
+
+                <div class="cardx-body">
+                  <div class="kv"><span class="k">Instance</span><span class="v mono">{{ it.instance_id }}</span></div>
+                  {% if it.route53_records and it.route53_records|length > 0 %}
+                    <div class="kv"><span class="k">DNS / Alias</span><span class="v mono">{{ it.route53_records|join(", ") }}</span></div>
+                  {% endif %}
+                  {% if it.private_ip %}<div class="kv"><span class="k">Private IP</span><span class="v mono">{{ it.private_ip }}</span></div>{% endif %}
+                  {% if web_group == "Grafana/Prometheus Web URL" %}
+                    <div class="kv"><span class="k">Grafana Remote Port</span><span class="v mono">3000</span></div>
+                    <div class="kv"><span class="k">Prometheus Remote Port</span><span class="v mono">9090</span></div>
+                  {% elif web_group == "KPOW Web URL" %}
+                    <div class="kv"><span class="k">KPOW Remote Port</span><span class="v mono">{{ web_port }}</span></div>
+                  {% elif web_group == "Kibana Web URL" %}
+                    <div class="kv"><span class="k">Kibana Remote Port</span><span class="v mono">8080</span></div>
+                  {% else %}
+                    <div class="kv"><span class="k">Web URL Remote Port</span><span class="v mono">{{ web_port }}</span></div>
+                  {% endif %}
+                  <div class="kv"><span class="k">Local Port</span><span class="v mono">{{ it.local_port }}</span></div>
+                </div>
+
+                <div class="cardx-actions">
+                  <form method="post" action="{{ url_for('webui_forward') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                    <input type="hidden" name="local_port" value="{{ it.local_port }}">
+                    <input type="hidden" name="remote_port" value="{{ web_port }}">
+                    <input type="hidden" name="web_type" value="{{ web_type }}">
+                    <input type="hidden" name="env" value="{{ it.env }}">
+                    <input type="hidden" name="can_forward" value="{{ 1 if it.can_forward else 0 }}">
+
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-ssm {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                      {% if web_group == "Grafana/Prometheus Web URL" %}
+                        Open Grafana Web URL
+                      {% elif web_group == "Kibana Web URL" %}
+                        Open Kibana Web URL
+                      {% else %}
+                        Open {{ web_label }} Web URL
+                      {% endif %}
+                    </button>
+                  </form>
+
+                  {% if web_group == "Grafana/Prometheus Web URL" %}
+                    <form method="post" action="{{ url_for('webui_forward') }}" class="d-inline">
+                      <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                      <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                      <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                      <input type="hidden" name="local_port" value="{{ it.prometheus_local_port or (it.local_port + 1000) }}">
+                      <input type="hidden" name="remote_port" value="9090">
+                      <input type="hidden" name="web_type" value="prometheus">
+                      <input type="hidden" name="env" value="{{ it.env }}">
+                      <input type="hidden" name="can_forward" value="{{ 1 if it.can_forward else 0 }}">
+
+                      <button type="submit"
+                              class="btn btn-sm btn-glass btn-3d btn-ssm {% if not it.can_forward %}btn-disabled{% endif %}"
+                              {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                        Open Prometheus Web URL
+                      </button>
+                    </form>
+                  {% endif %}
+
+                  <form method="post" action="{{ url_for('ssm_shell') }}" class="d-inline">
+                    <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                    <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                    <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                    <button type="submit"
+                            class="btn btn-sm btn-glass btn-3d btn-open {% if not it.can_forward %}btn-disabled{% endif %}"
+                            {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                      SSM Shell
+                    </button>
+                  </form>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+    {% endfor %}
+
+
+    <!-- KES PANEL -->
+    {% if ec2_grouped.get("KES") and ec2_grouped.get("KES")|length > 0 %}
+      <div class="tech-section" id="ec2-KES" data-tech="KES">
+        <div class="panel-head">
+          <div class="panel-title">KES instances</div>
+          <div class="muted">{{ ec2_grouped.get("KES")|length }} instances • Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        <div class="cards">
+          {% for it in ec2_grouped.get("KES") %}
+            {% set st = (it.state or 'unknown')|lower %}
+            <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="KES" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+              <div class="cardx-head">
+                <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                  {{ it.state or 'unknown' }}
+                </div>
+              </div>
+
+              <div class="cardx-body">
+                <div class="kv"><span class="k">Instance</span><span class="v mono">{{ it.instance_id }}</span></div>
+                {% if it.private_ip %}<div class="kv"><span class="k">Private IP</span><span class="v mono">{{ it.private_ip }}</span></div>{% endif %}
+                <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+                <div class="kv"><span class="k">Remote Port</span><span class="v mono">{{ it.remote_port }}</span></div>
+                <div class="kv"><span class="k">Local Port</span><span class="v mono">{{ it.local_port }}</span></div>
+              </div>
+
+              <div class="cardx-actions">
+                <form method="post" action="{{ url_for('ssm_shell') }}" class="d-inline">
+                  <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                  <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                  <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                  <button type="submit"
+                          class="btn btn-sm btn-glass btn-3d btn-open {% if not it.can_forward %}btn-disabled{% endif %}"
+                          {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                    SSM Shell
+                  </button>
+                </form>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+        <!-- REDIS PANEL -->
+    {% if ec2_grouped.get("Redis") and ec2_grouped.get("Redis")|length > 0 %}
+      <div class="tech-section" id="ec2-Redis" data-tech="REDIS">
+        <div class="panel-head">
+          <div class="panel-title">Redis instances</div>
+          <div class="muted">{{ ec2_grouped.get("Redis")|length }} instances • Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        <div class="cards">
+          {% for it in ec2_grouped.get("Redis") %}
+            {% set st = (it.state or 'unknown')|lower %}
+            <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="REDIS" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+
+              <div class="cardx-head">
+                <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+
+                <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                  {{ it.state or 'unknown' }}
+                </div>
+              </div>
+
+              <div class="cardx-body">
+                <div class="kv">
+                  <span class="k">Instance</span>
+                  <span class="v mono">{{ it.instance_id }}</span>
+                </div>
+                <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+
+                <div class="kv">
+                  <span class="k">Redis Port</span>
+                  <span class="v mono">6379</span>
+                </div>
+
+                <div class="kv">
+                  <span class="k">Local Port</span>
+                  <span class="v mono">{{ it.local_port }}</span>
+                </div>
+              </div>
+
+              <div class="cardx-actions">
+
+                <form method="post" action="{{ url_for('ssm_forward') }}" class="d-inline">
+                  <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                  <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                  <input type="hidden" name="target_type" value="redis">
+                  <input type="hidden" name="aws_target" value="{{ it.instance_id }}">
+                  <input type="hidden" name="remote_host" value="127.0.0.1">
+                  <input type="hidden" name="remote_port" value="6379">
+                  <input type="hidden" name="local_port" value="{{ it.local_port }}">
+                  <input type="hidden" name="env" value="{{ it.env }}">
+                  <input type="hidden" name="can_forward" value="{{ 1 if it.can_forward else 0 }}">
+
+                  <button type="submit"
+                          class="btn btn-sm btn-glass btn-3d btn-ssm {% if not it.can_forward %}btn-disabled{% endif %}"
+                          {% if not it.can_forward %}disabled{% endif %}>
+                    Redis Tunnel
+                  </button>
+                </form>
+
+              </div>
+
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- JUMPBOX PANEL -->
+    {% if ec2_grouped.get("Jumpbox") and ec2_grouped.get("Jumpbox")|length > 0 %}
+      <div class="tech-section" id="ec2-Jumpbox" data-tech="JUMPBOX">
+        <div class="panel-head">
+          <div class="panel-title">Jumpbox instances</div>
+          <div class="muted">{{ ec2_grouped.get("Jumpbox")|length }} instances • Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        <div class="cards">
+          {% for it in ec2_grouped.get("Jumpbox") %}
+            {% set st = (it.state or 'unknown')|lower %}
+            <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="JUMPBOX" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+              <div class="cardx-head">
+                <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                  {{ it.state or 'unknown' }}
+                </div>
+              </div>
+
+              <div class="cardx-body">
+                <div class="kv"><span class="k">Instance</span><span class="v mono">{{ it.instance_id }}</span></div>
+                <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+              </div>
+
+              <div class="cardx-actions">
+                <form method="post" action="{{ url_for('ssm_shell') }}" class="d-inline">
+                  <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                  <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                  <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                  <button type="submit"
+                          class="btn btn-sm btn-glass btn-3d btn-open {% if not it.can_forward %}btn-disabled{% endif %}"
+                          {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                    SSM Shell
+                  </button>
+                </form>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- EC2 PANEL -->
+    {% if ec2_grouped.get("EC2") and ec2_grouped.get("EC2")|length > 0 %}
+      <div class="tech-section" id="ec2-EC2" data-tech="EC2">
+        <div class="panel-head">
+          <div class="panel-title">EC2 instances</div>
+          <div class="muted">{{ ec2_grouped.get("EC2")|length }} instances • Region: <span class="mono">{{ selected_region }}</span></div>
+        </div>
+
+        <div class="cards">
+          {% for it in ec2_grouped.get("EC2") %}
+            {% set st = (it.state or 'unknown')|lower %}
+            <div class="cardx glass searchable-card" data-env="{{ it.env }}" data-region="{{ it.region if it.region is defined and it.region else selected_region }}" data-tech="EC2" data-target-id="{{ it.target_id }}" data-favorite="{{ 1 if it.is_favorite else 0 }}">
+              <div class="cardx-head">
+                <div class="cardx-title">{{ it.name }}</div>
+                  <button type="button"
+                          class="fav-btn {% if it.is_favorite %}active{% endif %}"
+                          data-target-id="{{ it.target_id }}"
+                          title="Add/remove favorite">
+                    {% if it.is_favorite %}★{% else %}☆{% endif %}
+                  </button>
+                <div class="pill {% if st == 'running' %}pill-ok{% elif st in ['stopped','stopping','terminated','shutting-down'] %}pill-bad{% else %}pill-warn{% endif %}">
+                  {{ it.state or 'unknown' }}
+                </div>
+              </div>
+
+              <div class="cardx-body">
+                <div class="kv"><span class="k">Instance</span><span class="v mono">{{ it.instance_id }}</span></div>
+                <div class="kv"><span class="k">DNS / Alias</span><span class="v mono dns-names">{% if it.route53_records and it.route53_records|length > 0 %}{{ it.route53_records|join(", ") }}{% else %}<span class="muted">Not mapped</span>{% endif %}</span></div>
+              </div>
+
+              <div class="cardx-actions">
+                <form method="post" action="{{ url_for('ssm_shell') }}" class="d-inline">
+                  <input type="hidden" name="profile" value="{{ selected_profile.name }}">
+                  <input type="hidden" name="region" value="{{ it.region if it is defined and it.region is defined and it.region else selected_region }}">
+                  <input type="hidden" name="instance_id" value="{{ it.instance_id }}">
+                  <button type="submit"
+                          class="btn btn-sm btn-glass btn-3d btn-open {% if not it.can_forward %}btn-disabled{% endif %}"
+                          {% if not it.can_forward %}disabled title="Instance is not running"{% endif %}>
+                    SSM Shell
+                  </button>
+                </form>
+              </div>
+
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+  {% endif %}
+</div>
+
+<!-- ✅ Jumpbox Change Modal -->
+<div class="modal fade" id="jumpboxModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg">
+    <div class="modal-content glass" style="border-radius:16px;">
+      <div class="modal-header" style="border-bottom:1px solid rgba(255,255,255,.08);">
+        <h5 class="modal-title">Choose Jumpbox</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="muted small mb-2" id="jbModalContext"></div>
+        <select class="form-select" id="jbModalSelect">
+          <option value="">Loading jumpboxes...</option>
+        </select>
+        <div class="muted small mt-2">This will become the default jumpbox for this Profile/Region/Env/Target type until you change it again.</div>
+      </div>
+      <div class="modal-footer" style="border-top:1px solid rgba(255,255,255,.08);">
+        <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-glass btn-3d btn-sso" id="jbModalSaveBtn">Save as Default</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Bootstrap JS (needed for modal) -->
+
+<style>
+.fav-btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#e7eefc;border-radius:999px;width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;font-size:18px;line-height:1;cursor:pointer;transition:.15s ease}
+.fav-btn:hover{transform:translateY(-1px);background:rgba(255,255,255,.12)}
+.fav-btn.active{background:rgba(255,193,7,.20);border-color:rgba(255,193,7,.55);color:#ffd76a}
+.fav-tab.active{border-color:rgba(255,193,7,.55)!important}
+
+.ssm-session-widget{position:fixed;right:22px;bottom:22px;width:460px;max-width:calc(100vw - 32px);z-index:9999;border-radius:18px;background:rgba(15,26,52,.97);border:1px solid rgba(129,155,205,.45);box-shadow:0 18px 45px rgba(0,0,0,.45);color:#eaf1ff;overflow:hidden}
+.ssm-session-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
+.ssm-session-title{font-weight:800;font-size:14px}.ssm-session-badge{font-size:12px;border-radius:999px;padding:3px 8px;background:rgba(50,150,255,.22);border:1px solid rgba(100,180,255,.35)}
+.ssm-session-body{padding:12px 14px;display:none}.ssm-session-widget.expanded .ssm-session-body{display:block}.ssm-session-text{font-size:12px;color:#cbd7f2;line-height:1.45;margin-bottom:10px}
+.ssm-session-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+.ssm-session-list {
+    max-height: 420px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-right: 3px;
+}
+
+.ssm-session-row {
+    border: 1px solid rgba(255,255,255,.10);
+    border-radius: 12px;
+    padding: 9px;
+    background: rgba(255,255,255,.035);
+    flex-shrink: 0;
+    overflow: visible;
+}
+
+.ssm-session-row-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+    margin-bottom: 4px;
+}
+
+.ssm-session-row-title {
+    font-weight: 700;
+    word-break: break-all;
+}
+
+.ssm-session-row-meta {
+    font-size: 11px;
+    color: #b8c7dd;
+    word-break: break-all;
+}
+
+.ssm-session-row-actions {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 9px;
+    padding-top: 7px;
+    border-top: 1px solid rgba(255,255,255,.08);
+    min-height: 30px;
+}
+
+.ssm-mini-btn {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,.18);
+    background: rgba(255,255,255,.06);
+    color: #eaf1ff;
+    cursor: pointer;
+}
+
+.ssm-mini-btn-danger {
+    display: inline-flex !important;
+    visibility: visible !important;
+    background: rgba(170,45,45,.35);
+    border-color: rgba(255,120,120,.65);
+    color: #ffdada;
+}
+.ssm-idle-ok{color:#7dffb2}.ssm-idle-warn{color:#ffd479}.ssm-stale{color:#ff9d9d}.ssm-active{color:#7dffb2}
+.ssm-idle-prompt {
+  position: fixed;
+  right: 28px;
+  bottom: 520px;
+  z-index: 10000;
+}
+
+.ssm-idle-card {
+  width: 340px;
+  border-radius: 16px;
+  background: rgba(15,26,52,.98);
+  border: 1px solid rgba(129,155,205,.45);
+  box-shadow: 0 18px 45px rgba(0,0,0,.45);
+  color: #eaf1ff;
+  padding: 14px;
+}
+
+.ssm-idle-title {
+  font-weight: 800;
+  margin-bottom: 8px;
+}
+
+.ssm-idle-message {
+  font-size: 12px;
+  color: #cbd7f2;
+  line-height: 1.45;
+  margin-bottom: 12px;
+}
+
+.ssm-idle-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+#dashboardToolbar.view-pick-mode {
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  min-height: 360px !important;
+  padding: 110px 12px !important;
+  border-radius: 18px !important;
+}
+
+#dashboardToolbar.view-pick-mode .toolbar-search,
+#dashboardToolbar.view-pick-mode #envFilterSelect,
+#dashboardToolbar.view-pick-mode #envSummary,
+#dashboardToolbar.view-pick-mode label:not(.view-label) {
+  display: none !important;
+}
+
+#dashboardToolbar.view-pick-mode .view-picker-row {
+  width: 100% !important;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  gap: 16px !important;
+}
+
+#dashboardToolbar.view-pick-mode .view-label {
+  display: inline-block !important;
+  font-size: 18px !important;
+  font-weight: 800 !important;
+}
+
+#dashboardToolbar.view-pick-mode #roleViewSelect {
+  width: 420px !important;
+  height: 62px !important;
+  font-size: 21px !important;
+  font-weight: 800 !important;
+  text-align: center !important;
+}
+
+
+/* Clean enterprise UX polish - keeps previous ATLAS look */
+.dashboard-toolbar{
+  position:sticky;
+  top:76px;
+  z-index:60;
+  backdrop-filter:blur(12px);
+}
+.view-quick-cards{
+  display:none;
+  width:100%;
+  grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+  gap:12px;
+  max-width:980px;
+  margin:18px auto 0;
+}
+.view-card{
+  border:1px solid rgba(255,255,255,.14);
+  background:rgba(255,255,255,.045);
+  color:#eaf1ff;
+  border-radius:16px;
+  padding:14px 15px;
+  text-align:left;
+  min-height:112px;
+  transition:.14s ease;
+}
+.view-card:hover{
+  transform:translateY(-2px);
+  background:rgba(255,255,255,.075);
+  border-color:rgba(255,255,255,.24);
+}
+.view-card-icon{font-size:25px;display:block;margin-bottom:8px}
+.view-card-title{font-weight:800;display:block}
+.view-card-sub{font-size:12px;color:#b8c7e3;display:block;margin-top:4px}
+#dashboardToolbar.view-pick-mode{flex-direction:column!important}
+.view-pick-mode .view-quick-cards{display:grid}
+.cardx{transition:transform .12s ease,border-color .12s ease}
+.cardx:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.20)}
+.cardx[data-favorite="1"]{border-color:rgba(255,193,7,.34)}
+.cardx-title::before{content:attr(data-tech-icon);margin-right:7px}
+.ssm-session-widget{width:500px}
+.ssm-session-stats{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.ssm-stat{font-size:11px;border-radius:999px;padding:3px 8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.045)}
+.ssm-stat-ok{color:#80ffb6}.ssm-stat-start{color:#ffd479}.ssm-stat-bad{color:#ff9d9d}
+.ssm-session-row{position:relative;overflow:hidden}
+.ssm-session-row::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:rgba(100,180,255,.55)}
+.ssm-session-row[data-status="stale"]::before{background:#ff7777}
+.ssm-session-row[data-status="starting"]::before{background:#ffd479}
+.ssm-session-row-title{display:flex;align-items:center;gap:8px}
+.ssm-type-icon{width:24px;height:24px;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;background:rgba(255,255,255,.07)}
+.atlas-toast-wrap{position:fixed;right:22px;top:92px;z-index:10001;display:flex;flex-direction:column;gap:10px}
+.atlas-toast{min-width:280px;max-width:430px;border-radius:14px;padding:11px 13px;background:rgba(15,26,52,.98);border:1px solid rgba(129,155,205,.35);box-shadow:0 12px 28px rgba(0,0,0,.28);color:#eaf1ff;font-size:13px}
+.atlas-toast.ok{border-color:rgba(73,230,143,.35)}.atlas-toast.warn{border-color:rgba(255,212,121,.38)}.atlas-toast.bad{border-color:rgba(255,120,120,.38)}
+@media (max-width:760px){.ssm-session-widget{right:10px;bottom:10px;width:calc(100vw - 20px)}#dashboardToolbar.view-pick-mode #roleViewSelect{width:min(92vw,420px)!important}.view-quick-cards{grid-template-columns:1fr}}
+
+
+
+.dns-names{color:#dbeafe;font-weight:700;word-break:break-all}
+
+</style>
+<div id="ssmIdlePrompt" class="ssm-idle-prompt" style="display:none;">
+  <div class="ssm-idle-card">
+    <div class="ssm-idle-title">SSM session check</div>
+    <div class="ssm-idle-message" id="ssmIdleMessage">
+      Your SSM tunnel has been active for some time. Continue session?
+    </div>
+    <div class="ssm-idle-actions">
+      <button type="button" class="ssm-mini-btn" id="ssmIdleContinueBtn">Continue</button>
+      <button type="button" class="ssm-mini-btn ssm-mini-btn-danger" id="ssmIdleDisconnectBtn">Disconnect</button>
+      <button type="button" class="ssm-mini-btn" id="ssmIdleLaterBtn">Ask Later</button>
+    </div>
+  </div>
+</div>
+{% if mode == 'dashboard' and selected_profile %}
+<div id="ssmSessionWidget" class="ssm-session-widget" style="display:none;">
+  <div class="ssm-session-head">
+    <div>
+      <div class="ssm-session-title">Active Sessions & Tunnels <span id="ssmSessionBadge" class="ssm-session-badge">0</span></div>
+      <div class="ssm-session-text" id="ssmSessionText" style="margin:2px 0 0 0;">Monitoring SSM tunnels...</div>
+    </div>
+    <button type="button" class="ssm-mini-btn" id="ssmSessionToggleBtn">Open</button>
+  </div>
+  <div class="ssm-session-body">
+    <div class="ssm-session-actions">
+      <button type="button" class="btn btn-sm btn-ssm" id="ssmKeepAliveNowBtn">Keep All Active</button>
+      <button type="button" class="btn btn-sm btn-glass ssm-stop-all-btn" id="ssmStopAllBtn">Stop All</button>
+      <button type="button" class="btn btn-sm btn-glass" id="ssmSessionRefreshBtn">Refresh</button>
+      <button type="button" class="btn btn-sm btn-glass" id="ssmSessionHideBtn">Hide</button>
+    </div>
+    <div id="ssmSessionList" class="ssm-session-list"></div>
+  </div>
+</div>
+{% endif %}
+
+{% if mode == 'dashboard' and selected_profile %}
+<div class="modal fade" id="diagnosticsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content atlas-modal">
+      <div class="modal-header">
+        <div>
+          <h5 class="modal-title">ATLAS V{{ app_version or "2.0.0" }} Diagnostics</h5>
+          <div class="muted small">Environment and packaging checks for troubleshooting</div>
+        </div>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="diagnosticsStatus" class="muted small mb-2">Loading diagnostics...</div>
+        <pre id="diagnosticsOutput" class="diagnostics-output">Loading...</pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm btn-glass" id="btnCopyDiagnostics">Copy Diagnostics</button>
+        <button type="button" class="btn btn-sm btn-glass" id="btnRefreshDiagnostics">Refresh</button>
+        <button type="button" class="btn btn-sm btn-ghost" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+  // ----------------------------------------------------------------------------
+  // Environment first + Technology second + Search
+  // ----------------------------------------------------------------------------
+
+  let currentEnvFilter = "ALL";
+  let currentTechFilter = null;
+  let currentRoleViewFilter = "";
+
+  const ROLE_VIEW_TECHS = {
+    ALL: [],
+    DBA: [
+      "MSSQL",
+      "POSTGRESQL",
+      "MYSQL",
+      "AURORA",
+      "POSTGRESQLCLUSTER",
+      "MYSQLCLUSTER",
+      "AURORACLUSTER",
+      "DOCDBCLUSTER",
+      "CLUSTER",
+      "REDIS",
+      "NEO4JWEBURL"
+    ],
+    WEB: [
+      "RABBITMQWEBURL",
+      "KPOWWEBURL",
+      "GRAFANAWEBURL",
+      "PROMETHEUSWEBURL",
+      "GRAFANA/PROMETHEUSWEBURL",
+      "KIBANAWEBURL"
+    ],
+    SHELL: [
+      "EC2",
+      "KES"
+    ],
+    JUMPBOX: [
+      "JUMPBOX"
+    ],
+    FAVORITES: [
+      "FAVORITES"
+    ]
+  };
+  const DASHBOARD_STATE_KEY =
+    "atlas_dashboard_state_{{ selected_profile.name|default('') }}_{{ selected_region|default('') }}";
+
+  function saveDashboardState() {
+    try {
+      localStorage.setItem(DASHBOARD_STATE_KEY, JSON.stringify({
+        env: currentEnvFilter || "ALL",
+        tech: currentTechFilter || "",
+        search: (document.getElementById("instanceSearch")?.value || "")
+      }));
+    } catch(e) {}
+  }
+
+  function loadDashboardState() {
+    try {
+      return JSON.parse(localStorage.getItem(DASHBOARD_STATE_KEY) || "{}");
+    } catch(e) {
+      return {};
+    }
+  }
+
+  function updateViewPickerMode() {
+    const toolbar = document.getElementById("dashboardToolbar");
+    if (!toolbar) return;
+    const pickMode = !currentRoleViewFilter;
+    toolbar.classList.toggle("view-pick-mode", pickMode);
+    toolbar.dataset.viewPicker = pickMode ? "1" : "0";
+  }
+
+  function restoreViewAfterAction() {
+    try {
+      const key = `${DASHBOARD_STATE_KEY}_return_once`;
+      const raw = sessionStorage.getItem(key);
+      if (!raw) return false;
+      sessionStorage.removeItem(key);
+      const st = JSON.parse(raw || "{}");
+      if (!st.roleView) return false;
+
+      currentRoleViewFilter = normalizeValue(st.roleView, "");
+      currentTechFilter = normalizeValue(st.tech, "") || currentTechFilter;
+      currentEnvFilter = normalizeValue(st.env, "ALL");
+
+      const rvSelect = document.getElementById("roleViewSelect");
+      if (rvSelect) rvSelect.value = currentRoleViewFilter;
+
+      const envSelect = document.getElementById("envFilterSelect");
+      if (envSelect && Array.from(envSelect.options).some(o => o.value === currentEnvFilter)) {
+        envSelect.value = currentEnvFilter;
+      }
+
+      const sb = document.getElementById("instanceSearch");
+      if (sb && st.search) sb.value = st.search;
+
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  function setupReturnViewOnTunnelForms() {
+    document.querySelectorAll("form").forEach(form => {
+      if (form.dataset.returnViewReady === "1") return;
+      const action = (form.getAttribute("action") || "").toLowerCase();
+      const isTunnelAction = action.includes("ssm") || action.includes("webui");
+      if (!isTunnelAction) return;
+
+      form.dataset.returnViewReady = "1";
+      form.addEventListener("submit", () => {
+        try {
+          sessionStorage.setItem(`${DASHBOARD_STATE_KEY}_return_once`, JSON.stringify({
+            roleView: currentRoleViewFilter || "",
+            env: currentEnvFilter || "ALL",
+            tech: currentTechFilter || "",
+            search: (document.getElementById("instanceSearch")?.value || "")
+          }));
+        } catch(e) {}
+      });
+    });
+  }
+
+  const preferredEnvOrder = ["DEV", "QA", "VNV", "STAGE", "PREPROD", "PROD", "PERF", "OTHER"];
+
+  function normalizeValue(v, fallback = "OTHER") {
+    return (v || fallback).toString().trim().toUpperCase();
+  }
+
+  function techIconFor(tech){
+    const t = normalizeValue(tech, "");
+    if (t.includes("MSSQL")) return "🗄️";
+    if (t.includes("POSTGRES")) return "🐘";
+    if (t.includes("MYSQL")) return "🐬";
+    if (t.includes("DOCDB")) return "🍃";
+    if (t.includes("REDIS")) return "⚡";
+    if (t.includes("NEO4J")) return "🕸️";
+    if (t.includes("RABBIT")) return "🐇";
+    if (t.includes("GRAFANA")) return "📊";
+    if (t.includes("PROMETHEUS")) return "📈";
+    if (t.includes("KIBANA")) return "🔎";
+    if (t.includes("KPOW")) return "📡";
+    if (t.includes("JUMPBOX")) return "🔐";
+    if (t.includes("EC2") || t.includes("KES")) return "🖥️";
+    return "🔹";
+  }
+
+  function polishCards(){
+    const cards = Array.from(document.querySelectorAll(".searchable-card"));
+    let db=0, web=0, shell=0, fav=0;
+    cards.forEach(card => {
+      const tech = normalizeValue(card.dataset.tech, "");
+      const title = card.querySelector(".cardx-title");
+      if (title) title.dataset.techIcon = techIconFor(tech);
+      if (card.dataset.favorite === "1") fav += 1;
+      if (["EC2","KES","JUMPBOX"].includes(tech)) shell += 1;
+      else if (tech === "NEO4JWEBURL") db += 1;
+      else if (tech.includes("WEBURL") || ["RABBITMQWEBURL","KPOWWEBURL","GRAFANAWEBURL","PROMETHEUSWEBURL","KIBANAWEBURL"].includes(tech)) web += 1;
+      else db += 1;
+    });
+    const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    setText("heroDbCount", db); setText("heroWebCount", web); setText("heroShellCount", shell); setText("heroFavCount", fav);
+  }
+
+  function populateEnvironmentDropdown() {
+    const envSelect = document.getElementById("envFilterSelect");
+    if (!envSelect) return;
+
+    const envs = new Set();
+    document.querySelectorAll(".searchable-card").forEach(card => {
+      envs.add(normalizeValue(card.dataset.env));
+    });
+
+    const ordered = [
+      ...preferredEnvOrder.filter(e => envs.has(e)),
+      ...Array.from(envs).filter(e => !preferredEnvOrder.includes(e)).sort()
+    ];
+
+    envSelect.innerHTML = "";
+
+    if (ordered.length === 0) {
+      envSelect.insertAdjacentHTML("beforeend", `<option value="ALL">ALL</option>`);
+      currentEnvFilter = "ALL";
+      return;
+    }
+
+    if (ordered.length > 1) {
+      envSelect.insertAdjacentHTML("beforeend", `<option value="ALL">ALL</option>`);
+      currentEnvFilter = "ALL";
+    } else {
+      currentEnvFilter = ordered[0];
+    }
+
+    ordered.forEach(env => {
+      envSelect.insertAdjacentHTML("beforeend", `<option value="${env}">${env}</option>`);
+    });
+
+    envSelect.value = currentEnvFilter;
+  }
+
+function techAllowedByRoleView(tech) {
+  const rv = currentRoleViewFilter || "";
+  if (!rv) return false;
+  if (rv === "ALL") return true;
+  const allowed = ROLE_VIEW_TECHS[rv] || [];
+  return allowed.includes(tech);
+}
+  
+  function visibleCardsForTech(tech) {
+    const selector = tech === "FAVORITES"
+      ? `.searchable-card[data-favorite="1"]`
+      : `.searchable-card[data-tech="${tech}"]`;
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter(card => {
+        const cardTech = normalizeValue(card.dataset.tech, "");
+        const envOk = currentEnvFilter === "ALL" || normalizeValue(card.dataset.env) === currentEnvFilter;
+        const roleOk = tech === "FAVORITES" || techAllowedByRoleView(cardTech);
+        return envOk && roleOk;
+      });
+  }
+
+  function refreshTechnologyButtons() {
+    const buttons = Array.from(document.querySelectorAll("#techFilterRow .tabbtn"));
+
+    if (!currentRoleViewFilter) {
+      buttons.forEach(btn => btn.style.display = "none");
+      document.getElementById("techFilterRow")?.style.setProperty("display", "none");
+      return;
+    }
+    document.getElementById("techFilterRow")?.style.removeProperty("display");
+
+    buttons.forEach(btn => {
+      const tech = normalizeValue(btn.dataset.techFilter, "");
+      const hasCards = visibleCardsForTech(tech).length > 0;
+      btn.style.display = hasCards ? "" : "none";
+      btn.classList.toggle("active", tech === currentTechFilter);
+    });
+
+    const activeBtn = buttons.find(btn => normalizeValue(btn.dataset.techFilter, "") === currentTechFilter && btn.style.display !== "none");
+    if (!activeBtn) {
+      const firstVisible = buttons.find(btn => btn.style.display !== "none");
+      currentTechFilter = firstVisible ? normalizeValue(firstVisible.dataset.techFilter, "") : null;
+    }
+
+    buttons.forEach(btn => {
+      btn.classList.toggle("active", normalizeValue(btn.dataset.techFilter, "") === currentTechFilter);
+    });
+  }
+
+  function setupCollapsibleEnvSections() {
+  document.querySelectorAll(".env-section").forEach(section => {
+    if (section.dataset.collapseReady === "1") return;
+    section.dataset.collapseReady = "1";
+
+    const env = normalizeValue(section.dataset.envSection);
+    const title = section.querySelector(".panel-title");
+    if (!title) return;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-sm btn-ghost env-collapse-btn";
+    btn.textContent = "−";
+    btn.style.marginLeft = "10px";
+
+    title.appendChild(btn);
+
+    btn.addEventListener("click", () => {
+      const key = `${DASHBOARD_STATE_KEY}_collapse_${env}_${currentTechFilter}`;
+      const nextCollapsed = section.dataset.collapsed !== "1";
+      section.dataset.collapsed = nextCollapsed ? "1" : "0";
+      localStorage.setItem(key, nextCollapsed ? "1" : "0");
+      setTimeout(applyInstanceFilters, 0);
+    });
+  });
+}
+
+function applyCollapseState() {
+  document.querySelectorAll(".env-section").forEach(section => {
+    const env = normalizeValue(section.dataset.envSection);
+    const key = `${DASHBOARD_STATE_KEY}_collapse_${env}_${currentTechFilter}`;
+    const collapsed = localStorage.getItem(key) === "1";
+
+    section.dataset.collapsed = collapsed ? "1" : "0";
+
+    const btn = section.querySelector(".env-collapse-btn");
+    if (btn) btn.textContent = collapsed ? "+" : "−";
+
+    const cards = section.nextElementSibling;
+    if (!cards || !cards.classList.contains("cards")) return;
+
+    const hasVisibleCards = Array.from(cards.querySelectorAll(".searchable-card"))
+      .some(card => card.style.display !== "none");
+
+    if (section.style.display === "none" || !hasVisibleCards) {
+      cards.style.display = "none";
+    } else {
+      cards.style.display = collapsed ? "none" : "";
+    }
+  });
+}
+
+  
+  function applyInstanceFilters() {
+    const sb = document.getElementById("instanceSearch");
+    const summary = document.getElementById("envSummary");
+    const q = sb ? (sb.value || "").trim().toLowerCase() : "";
+
+    refreshTechnologyButtons();
+
+    let visibleCount = 0;
+
+    document.querySelectorAll(".searchable-card").forEach(card => {
+      const text = (card.innerText || "").toLowerCase();
+      const cardEnv = normalizeValue(card.dataset.env);
+      const cardTech = normalizeValue(card.dataset.tech, "");
+
+      const envOk = currentEnvFilter === "ALL" || cardEnv === currentEnvFilter;
+      const techOk = !currentTechFilter ||
+        (currentTechFilter === "FAVORITES" ? card.dataset.favorite === "1" : cardTech === currentTechFilter);
+      const searchOk = !q || text.includes(q);
+      const roleOk =
+        currentRoleViewFilter &&
+        (currentRoleViewFilter === "ALL" ||
+        (currentRoleViewFilter === "FAVORITES" ? card.dataset.favorite === "1" : techAllowedByRoleView(cardTech)));
+      const show = envOk && techOk && searchOk && roleOk;
+      card.style.display = show ? "" : "none";
+      if (show) visibleCount += 1;
+    });
+
+    document.querySelectorAll(".env-section").forEach(section => {
+      const sectionEnv = normalizeValue(section.dataset.envSection);
+      const siblingCards = section.nextElementSibling;
+      const hasVisibleCards = siblingCards && Array.from(siblingCards.querySelectorAll(".searchable-card"))
+        .some(card => card.style.display !== "none");
+
+      section.style.display =
+        ((currentEnvFilter === "ALL" || sectionEnv === currentEnvFilter) && hasVisibleCards) ? "" : "none";
+    });
+
+    document.querySelectorAll(".tech-section .cards").forEach(container => {
+      const visibleCards = Array.from(container.querySelectorAll(".searchable-card"))
+        .some(card => card.style.display !== "none");
+      container.style.display = visibleCards ? "" : "none";
+    });
+
+    document.querySelectorAll(".tech-section").forEach(section => {
+      const sectionTech = normalizeValue(section.dataset.tech, "");
+      const hasVisibleCards = Array.from(section.querySelectorAll(".searchable-card"))
+        .some(card => card.style.display !== "none");
+      const techSectionOk = currentTechFilter === "FAVORITES" || sectionTech === currentTechFilter;
+      section.style.display = (techSectionOk && hasVisibleCards) ? "" : "none";
+    });
+
+    applyCollapseState();
+    saveDashboardState();
+
+    if (summary) {
+      const envText = currentEnvFilter === "ALL" ? "all environments" : currentEnvFilter;
+      const techText = currentTechFilter || "no technology";
+      if (!currentRoleViewFilter) {
+      summary.textContent = "Please select a view to display systems";
+      } else {
+        summary.textContent = `${visibleCount} visible item(s) • ${envText} • ${techText}`;
+      }
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    polishCards();
+    populateEnvironmentDropdown();
+    setupCollapsibleEnvSections();
+    setupReturnViewOnTunnelForms();
+
+    const savedState = loadDashboardState();
+    const restoredAfterAction = restoreViewAfterAction();
+    
+    const firstTechBtn = document.querySelector("#techFilterRow .tabbtn");
+    const savedTech = normalizeValue(savedState.tech, "");
+
+    if (!restoredAfterAction) {
+      if (savedTech && document.querySelector(`#techFilterRow .tabbtn[data-tech-filter="${savedTech}"]`)) {
+        currentTechFilter = savedTech;
+      } else {
+        currentTechFilter = firstTechBtn ? normalizeValue(firstTechBtn.dataset.techFilter, "") : null;
+      }
+    } else if (currentTechFilter && !document.querySelector(`#techFilterRow .tabbtn[data-tech-filter="${currentTechFilter}"]`)) {
+      currentTechFilter = firstTechBtn ? normalizeValue(firstTechBtn.dataset.techFilter, "") : null;
+    }
+
+    if (!restoredAfterAction && savedState.env) {
+      currentEnvFilter = normalizeValue(savedState.env, "ALL");
+      const envSelect = document.getElementById("envFilterSelect");
+      if (envSelect && Array.from(envSelect.options).some(o => o.value === currentEnvFilter)) {
+        envSelect.value = currentEnvFilter;
+      }
+    }
+
+    if (!restoredAfterAction && savedState.search) {
+      const sb = document.getElementById("instanceSearch");
+      if (sb) sb.value = savedState.search;
+    }
+
+    document.querySelectorAll("#techFilterRow .tabbtn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        currentTechFilter = normalizeValue(btn.dataset.techFilter, "");
+        saveDashboardState();
+        applyInstanceFilters();
+      });
+    });
+
+    const sb = document.getElementById("instanceSearch");
+    if (sb) sb.addEventListener("input", () => {
+      saveDashboardState();
+      applyInstanceFilters();
+    });
+
+    const envSelect = document.getElementById("envFilterSelect");
+    if (envSelect) {
+      envSelect.addEventListener("change", () => {
+        currentEnvFilter = normalizeValue(envSelect.value, "ALL");
+        saveDashboardState();
+        applyInstanceFilters();
+      });
+    }
+    const roleViewSelect = document.getElementById("roleViewSelect");
+    if (roleViewSelect) {
+      roleViewSelect.addEventListener("change", () => {
+        currentRoleViewFilter = roleViewSelect.value === "" ? "" : normalizeValue(roleViewSelect.value, "ALL");
+
+        if (currentRoleViewFilter === "FAVORITES") {
+          currentTechFilter = "FAVORITES";
+        }
+
+        saveDashboardState();
+        applyInstanceFilters();
+        updateViewPickerMode();
+      });
+    }
+
+    document.querySelectorAll("[data-role-view-card]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const val = normalizeValue(btn.dataset.roleViewCard, "");
+        const rvSelect = document.getElementById("roleViewSelect");
+        currentRoleViewFilter = val;
+        if (rvSelect) rvSelect.value = val;
+        if (val === "FAVORITES") currentTechFilter = "FAVORITES";
+        saveDashboardState();
+        applyInstanceFilters();
+        updateViewPickerMode();
+      });
+    });
+
+    if (document.querySelector(".searchable-card")) {
+      applyInstanceFilters();
+    }
+    updateViewPickerMode();
+  });
+
+
+  async function toggleFavorite(btn) {
+    const targetId = btn.dataset.targetId || "";
+    if (!targetId) return;
+
+    const card = btn.closest(".searchable-card");
+    const currentlyFav = card && card.dataset.favorite === "1";
+    const nextFav = !currentlyFav;
+
+    btn.disabled = true;
+    try {
+      const r = await fetch("/api/favorites/toggle", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          profile: "{{ selected_profile.name }}",
+          region: (card && card.dataset.region) ? card.dataset.region : "{{ selected_region }}",
+          target_id: targetId,
+          favorite: nextFav
+        })
+      });
+      const data = await r.json();
+      if (!data || !data.ok) {
+        alert((data && data.error) || "Failed to update favorite.");
+        return;
+      }
+
+      if (card) card.dataset.favorite = data.is_favorite ? "1" : "0";
+      btn.classList.toggle("active", !!data.is_favorite);
+      btn.textContent = data.is_favorite ? "★" : "☆";
+      refreshTechnologyButtons();
+      applyInstanceFilters();
+    } catch (e) {
+      alert("Failed to update favorite: " + e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    document.querySelectorAll(".fav-btn").forEach(btn => {
+      btn.addEventListener("click", () => toggleFavorite(btn));
+    });
+  });
+
+  // Update job polling
+  const jobBox = document.getElementById('jobBox');
+  if (jobBox) {
+    const jobId = jobBox.getAttribute('data-jobid');
+    const statusEl = document.getElementById('jobStatus');
+    const lastEl = document.getElementById('jobLast');
+    const dotsEl = document.getElementById('dots');
+    const pbFill = document.getElementById('pbFill');
+
+    let dotCount = 0;
+    let percent = 6;
+
+    function tickDots(){
+      dotCount = (dotCount + 1) % 6;
+      if (dotsEl) dotsEl.textContent = '.'.repeat(dotCount) || '.';
+    }
+
+    function tickProgress(){
+      if (percent < 92) {
+        const step = percent < 40 ? 4 : (percent < 70 ? 2 : 1);
+        percent = Math.min(92, percent + step);
+        if (pbFill) pbFill.style.width = percent + '%';
+      }
+    }
+
+    async function pollJob(){
+      try{
+        const res = await fetch(`/update-catalog/status/${jobId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (statusEl) statusEl.textContent = data.status || '';
+        if (lastEl) lastEl.textContent = data.last_update || '';
+
+        if (data.status === 'completed') {
+          percent = 100;
+          if (pbFill) pbFill.style.width = '100%';
+          setTimeout(() => window.location.reload(), 500);
+          return;
+        }
+        if (data.status === 'failed') {
+          percent = Math.max(percent, 96);
+          if (pbFill) pbFill.style.width = percent + '%';
+          return;
+        }
+      }catch(e){}
+      setTimeout(pollJob, 1400);
+    }
+
+    setInterval(tickDots, 350);
+    setInterval(tickProgress, 1000);
+    setTimeout(pollJob, 500);
+  }
+
+  // ------------------------------------------------------------------------------------
+  // ✅ Jumpbox effective display + modal selector
+  // Requires backend endpoints:
+  //   GET  /api/jumpboxes?profile=...&region=...&env=...
+  //   GET  /api/jumpbox/get?profile=...&region=...&env=...&target_type=...
+  //        -> should return effective_jumpbox_id + source (saved/auto)
+  //   POST /api/jumpbox/set   {profile, region, env, target_type, jumpbox_id}
+  // ------------------------------------------------------------------------------------
+
+  const jbModalEl = document.getElementById("jumpboxModal");
+  const jbModal = new bootstrap.Modal(jbModalEl);
+  const jbSelect = document.getElementById("jbModalSelect");
+  const jbSaveBtn = document.getElementById("jbModalSaveBtn");
+  const jbCtx = document.getElementById("jbModalContext");
+
+  let jbContext = null; // {profile, region, env, target_type, span}
+
+  async function loadEffectiveJumpbox(spanEl) {
+    const profile = spanEl.dataset.profile;
+    const region  = spanEl.dataset.region;
+    const env     = (spanEl.dataset.env || "OTHER").toUpperCase();
+    const targetType = (spanEl.dataset.targetType || "db").toLowerCase();
+
+    const url = `/api/jumpbox/get?profile=${encodeURIComponent(profile)}&region=${encodeURIComponent(region)}&env=${encodeURIComponent(env)}&target_type=${encodeURIComponent(targetType)}`;
+    const r = await fetch(url);
+    const data = await r.json();
+
+    if (!data || !data.ok) {
+      spanEl.textContent = "(Not found)";
+      return;
+    }
+
+    const eff = data.effective_jumpbox_id || "";
+    const src = (data.source || "").toLowerCase();
+    spanEl.textContent = eff ? eff : "(Not found)";
+
+    // optional label
+    const srcEl = spanEl.parentElement.querySelector(".jb-source");
+    if (srcEl) {
+      srcEl.textContent = src ? ` (${src})` : "";
+    }
+  }
+
+  async function loadJumpboxList(profile, region, env) {
+    jbSelect.innerHTML = `<option value="">Loading jumpboxes...</option>`;
+    const url = `/api/jumpboxes?profile=${encodeURIComponent(profile)}&region=${encodeURIComponent(region)}&env=${encodeURIComponent(env)}`;
+    const r = await fetch(url);
+    const data = await r.json();
+
+    jbSelect.innerHTML = "";
+    if (!data || !data.ok) {
+      jbSelect.innerHTML = `<option value="">(Failed to load jumpboxes)</option>`;
+      return;
+    }
+
+    const opts = data.jumpboxes || [];
+    if (opts.length === 0) {
+      jbSelect.innerHTML = `<option value="">(No jumpboxes found)</option>`;
+      return;
+    }
+
+    jbSelect.insertAdjacentHTML("beforeend", `<option value="">-- Select Jumpbox --</option>`);
+    for (const j of opts) {
+      const label = `${(j.name || j.instance_id)} (${j.instance_id}) [${(j.env || "OTHER")}] ${(j.state || "")}`;
+      jbSelect.insertAdjacentHTML("beforeend", `<option value="${j.instance_id}">${label}</option>`);
+    }
+  }
+
+  async function saveDefaultJumpbox(ctx, jumpboxId) {
+    const r = await fetch("/api/jumpbox/set", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        profile: ctx.profile,
+        region: ctx.region,
+        env: ctx.env,
+        target_type: ctx.target_type,
+        jumpbox_id: jumpboxId
+      })
+    });
+
+    const data = await r.json();
+    if (!data || !data.ok) {
+      alert(data.error || "Failed to save jumpbox preference.");
+      return false;
+    }
+    return true;
+  }
+
+  document.addEventListener("DOMContentLoaded", async () => {
+    // 1) Load effective jumpbox display on each DB card
+    const spans = Array.from(document.querySelectorAll(".jb-effective"));
+    for (const sp of spans) {
+      try { await loadEffectiveJumpbox(sp); } catch(e) { sp.textContent = "(Error)"; }
+    }
+
+    // 2) Change button -> confirm -> open modal
+    const changeBtns = Array.from(document.querySelectorAll(".jb-change"));
+    for (const btn of changeBtns) {
+      btn.addEventListener("click", async () => {
+        const ok = confirm("Do you want to update the jumpbox?");
+        if (!ok) return;
+
+        const profile = btn.dataset.profile;
+        const region  = btn.dataset.region;
+        const env     = (btn.dataset.env || "OTHER").toUpperCase();
+        const targetType = (btn.dataset.targetType || "db").toLowerCase();
+
+        const span = spans.find(s =>
+          s.dataset.profile === profile &&
+          s.dataset.region  === region &&
+          (s.dataset.env || "OTHER").toUpperCase() === env &&
+          (s.dataset.targetType || "db").toLowerCase() === targetType
+        );
+
+        jbContext = { profile, region, env, target_type: targetType, span };
+
+        jbCtx.textContent = `Profile: ${profile} • Region: ${region} • Env: ${env} • TargetType: ${targetType}`;
+
+        await loadJumpboxList(profile, region, env);
+
+        // preselect current effective if present
+        const current = (span && span.textContent && !span.textContent.includes("(")) ? span.textContent.trim() : "";
+        if (current) {
+          for (const opt of jbSelect.options) {
+            if (opt.value === current) { jbSelect.value = current; break; }
+          }
+        }
+
+        jbModal.show();
+      });
+    }
+
+    // 3) Save in modal
+    jbSaveBtn.addEventListener("click", async () => {
+      if (!jbContext) return;
+      const chosen = jbSelect.value;
+      if (!chosen) {
+        alert("Please select a jumpbox.");
+        return;
+      }
+
+      const ok = await saveDefaultJumpbox(jbContext, chosen);
+      if (!ok) return;
+
+      // update UI immediately
+      if (jbContext.span) {
+        jbContext.span.textContent = chosen;
+        const srcEl = jbContext.span.parentElement.querySelector(".jb-source");
+        if (srcEl) srcEl.textContent = " (saved)";
+      }
+
+      jbModal.hide();
+      alert("Saved! This jumpbox will be used until you change it again.");
+    });
+  });
+
+
+  // ------------------------------------------------------------------------------------
+  // Live Session & Tunnel Manager + SSM idle protection
+  // Auto keepalive touches active localhost tunnels every 10 minutes.
+  // The floating widget shows active/stale tunnels, ports, duration, open URL, stop.
+  // ------------------------------------------------------------------------------------
+  {% if mode == 'dashboard' and selected_profile %}
+  const ssmSessionWidget = document.getElementById("ssmSessionWidget");
+  const ssmSessionBadge = document.getElementById("ssmSessionBadge");
+  const ssmSessionText = document.getElementById("ssmSessionText");
+  const ssmSessionList = document.getElementById("ssmSessionList");
+  const ssmIdleContinueBtn = document.getElementById("ssmIdleContinueBtn");
+  const ssmIdleDisconnectBtn = document.getElementById("ssmIdleDisconnectBtn");
+  const ssmIdleLaterBtn = document.getElementById("ssmIdleLaterBtn");
+
+  if (ssmIdleContinueBtn) {
+    ssmIdleContinueBtn.addEventListener("click", async () => {
+      if (idlePromptTunnelId) {
+        await fetch("/api/ssm/keepalive", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({tunnel_id: idlePromptTunnelId})
+        });
+      }
+
+      hideSsmIdlePrompt();
+      refreshSsmTunnelState();
+    });
+  }
+
+  if (ssmIdleDisconnectBtn) {
+    ssmIdleDisconnectBtn.addEventListener("click", async () => {
+      if (idlePromptTunnelId) {
+        await fetch("/api/ssm/stop-tunnel", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({tunnel_id: idlePromptTunnelId})
+        });
+      }
+
+      hideSsmIdlePrompt();
+      refreshSsmTunnelState();
+    });
+  }
+
+  if (ssmIdleLaterBtn) {
+    ssmIdleLaterBtn.addEventListener("click", () => {
+      hideSsmIdlePrompt();
+    });
+  }
+  const ssmKeepAliveNowBtn = document.getElementById("ssmKeepAliveNowBtn");
+  const ssmSessionToggleBtn = document.getElementById("ssmSessionToggleBtn");
+  const ssmSessionRefreshBtn = document.getElementById("ssmSessionRefreshBtn");
+  const ssmSessionHideBtn = document.getElementById("ssmSessionHideBtn");
+  const btnConnectionStatus = document.getElementById("btnConnectionStatus");
+  const ssmProfile = {{ selected_profile.name|tojson }};
+  const ssmRegion = {{ selected_region|tojson }};
+  const ssmRegionQuery = (ssmRegion === "ALL") ? "" : ssmRegion;
+  let ssmActiveTunnelCount = 0;
+  let ssmWidgetHidden = true;
+  if (ssmSessionWidget) {
+  ssmSessionWidget.style.display = "none";
+  ssmSessionWidget.classList.remove("expanded");
+  }
+  let alreadyWarnedStaleTunnels = new Set();
+  let idlePromptTunnelId = "";
+  let idlePromptShownFor = new Set();
+  const SSM_IDLE_WARN_SECONDS = 25 * 60;
+
+  function fmtDuration(totalSeconds){
+    totalSeconds = Math.max(0, Number(totalSeconds || 0));
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  function escHtml(v){
+    return (v ?? "").toString().replace(/[&<>'"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[ch]));
+  }
+
+  function ssmTypeIcon(t){
+    const x = (t || "").toLowerCase();
+    if (x === "db" || x.includes("sql") || x.includes("docdb")) return "🗄️";
+    if (x === "shell") return "🖥️";
+    if (x.includes("grafana")) return "📊";
+    if (x.includes("rabbit")) return "🐇";
+    if (x.includes("neo4j")) return "🕸️";
+    if (x.includes("prometheus")) return "📈";
+    return "🌐";
+  }
+
+  function showAtlasToast(message, kind="ok", timeoutMs=4200){
+    const wrap = document.getElementById("atlasToastWrap");
+    if (!wrap) return;
+    const div = document.createElement("div");
+    div.className = `atlas-toast ${kind}`;
+    div.innerHTML = escHtml(message);
+    wrap.appendChild(div);
+    setTimeout(() => { div.style.opacity = "0"; div.style.transform = "translateY(-6px)"; }, timeoutMs);
+    setTimeout(() => div.remove(), timeoutMs + 450);
+  }
+
+  function renderSsmSessions(tunnels){
+    if (!ssmSessionList) return;
+    if (!tunnels || tunnels.length === 0) {
+      ssmSessionList.innerHTML = `<div class="ssm-session-text">No active sessions detected yet. Start a DB/Web UI tunnel to see it here.</div>`;
+      return;
+    }
+    ssmSessionList.innerHTML = tunnels.map(t => {
+      const statusClass = t.status === "active" ? "ssm-active" : "ssm-stale";
+      const openBtn = t.url ? `<button type="button" class="ssm-mini-btn" onclick="window.open('${escHtml(t.url)}','_blank')">Open</button>` : "";
+      const copyText = t.url || (t.local_port ? `127.0.0.1:${t.local_port}` : "");
+      return `
+        <div class="ssm-session-row" data-tunnel-id="${escHtml(t.id)}" data-status="${escHtml(t.status || "active")}">
+          <div class="ssm-session-row-top">
+            <div class="ssm-session-row-title"><span class="ssm-type-icon">${ssmTypeIcon(t.type)}</span>${escHtml(t.label || t.target || t.type)}</div>
+            <div class="${statusClass}">${escHtml(t.status || "active")}</div>
+          </div>
+          <div class="ssm-session-row-meta">${escHtml((t.type || "session").toUpperCase())} • ${fmtDuration(t.duration_seconds)} • PID ${escHtml(t.pid || "-")}</div>
+          <div class="ssm-session-row-meta">Local: ${escHtml(t.local_port || "-")} → Remote: ${escHtml(t.remote_host || t.target || "")}${t.remote_port ? ":" + escHtml(t.remote_port) : ""}</div>
+          <div class="ssm-session-row-actions">
+            ${openBtn}
+            ${copyText ? `<button type="button" class="ssm-mini-btn" data-copy="${escHtml(copyText)}">Copy</button>` : ""}
+            <button type="button" class="ssm-mini-btn" data-keepalive="${escHtml(t.id)}">Keepalive</button>
+            <button type="button" class="ssm-mini-btn" data-restart="${escHtml(t.id)}">Restart</button>
+            <button type="button" class="ssm-mini-btn ssm-mini-btn-danger" data-stop="${escHtml(t.id)}">Stop</button>
+          </div>
+        </div>`;
+    }).join("");
+  }
+
+  function showSsmIdlePrompt(tunnel) {
+    if (!tunnel || !tunnel.id) return;
+    if (idlePromptShownFor.has(tunnel.id)) return;
+
+    idlePromptTunnelId = tunnel.id;
+    idlePromptShownFor.add(tunnel.id);
+
+    const prompt = document.getElementById("ssmIdlePrompt");
+    const msg = document.getElementById("ssmIdleMessage");
+
+    if (msg) {
+      msg.textContent =
+        `Tunnel "${tunnel.label || tunnel.target || tunnel.type}" has been active for ` +
+        `${fmtDuration(tunnel.duration_seconds)}. Continue or disconnect?`;
+    }
+
+    if (prompt) prompt.style.display = "block";
+  }
+
+  function hideSsmIdlePrompt() {
+    const prompt = document.getElementById("ssmIdlePrompt");
+    if (prompt) prompt.style.display = "none";
+    idlePromptTunnelId = "";
+  }
+async function refreshSsmTunnelState(){
+    try{
+      const r = await fetch(`/api/ssm/active-tunnels?profile=${encodeURIComponent(ssmProfile)}&region=${encodeURIComponent(ssmRegionQuery)}`);
+      const data = await r.json();
+      const tunnels = data.tunnels || [];
+      const activeCount = tunnels.filter(x => x.status === "active").length;
+      const startingCount = tunnels.filter(x => x.status === "starting").length;
+      const staleCount = tunnels.length - activeCount - startingCount;
+
+      ssmActiveTunnelCount = tunnels.length;
+
+      if (ssmSessionBadge) ssmSessionBadge.textContent = tunnels.length;
+
+      renderSsmSessions(tunnels);
+
+      if (ssmSessionText) {
+        if (tunnels.length > 0) {
+          ssmSessionText.innerHTML = `
+            <div class="ssm-session-stats">
+              <span class="ssm-stat ssm-stat-ok">🟢 ${activeCount} active</span>
+              <span class="ssm-stat ssm-stat-start">🟡 ${startingCount} starting</span>
+              <span class="ssm-stat ssm-stat-bad">🔴 ${staleCount} stale</span>
+            </div>`;
+        } else {
+          ssmSessionText.innerHTML = `0 active. Backend health check every 30 seconds.`;
+        }
+      }
+
+      const staleTunnels = tunnels.filter(x => x.status !== "active" && x.status !== "starting");
+
+      if (!ssmWidgetHidden) {
+        staleTunnels.forEach(t => {
+          if (!alreadyWarnedStaleTunnels.has(t.id)) {
+            alreadyWarnedStaleTunnels.add(t.id);
+            showAtlasToast(`Tunnel ${t.label || t.target || t.type} is ${t.status}. Auto reconnect may run once.`, "warn");
+          }
+        });
+
+        tunnels.filter(t => t.status === "active").forEach(t => alreadyWarnedStaleTunnels.delete(t.id));
+
+        tunnels
+          .filter(t => t.status === "active" && Number(t.duration_seconds || 0) >= SSM_IDLE_WARN_SECONDS)
+          .forEach(t => showSsmIdlePrompt(t));
+      }
+
+    }catch(e){
+      if (ssmSessionText) {
+        ssmSessionText.innerHTML = `<span class="ssm-idle-warn">Session monitor error</span>: ${escHtml(e)}`;
+      }
+    }
+  }
+
+  async function sendSsmKeepAlive(manual=false, tunnelId=""){
+    if (ssmActiveTunnelCount <= 0 && !manual) return;
+    try{
+      const r = await fetch("/api/ssm/keepalive", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({profile:ssmProfile, region:ssmRegion, tunnel_id:tunnelId})
+      });
+      const data = await r.json();
+      if (ssmSessionWidget) ssmSessionWidget.style.display = "block";
+      const okCount = (data.results || []).filter(x => x.ok).length;
+      if (ssmSessionText) ssmSessionText.innerHTML = `<span class="ssm-idle-ok">Keepalive sent</span>: ${okCount}/${data.count || 0} responded.`;
+      await refreshSsmTunnelState();
+    }catch(e){
+      if (ssmSessionWidget) ssmSessionWidget.style.display = "block";
+      if (ssmSessionText) ssmSessionText.innerHTML = `<span class="ssm-idle-warn">Keepalive failed</span>. ${escHtml(e)}`;
+    }
+  }
+
+  async function stopAllSsmTunnels(){
+    if (ssmActiveTunnelCount <= 0) {
+      showAtlasToast("No tracked sessions to stop", "ok");
+      return;
+    }
+    if (!confirm(`Stop all ${ssmActiveTunnelCount} tracked SSM sessions/tunnels for this profile and region?`)) return;
+    if (ssmStopAllBtn) {
+      ssmStopAllBtn.disabled = true;
+      ssmStopAllBtn.textContent = "Stopping...";
+    }
+    try {
+      const r = await fetch("/api/ssm/stop-all", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({profile:ssmProfile, region:ssmRegion})
+      });
+      const data = await r.json().catch(() => ({}));
+      showAtlasToast(`Stopped ${data.stopped || 0}/${data.count || 0} session(s)`, data.ok === false ? "warn" : "ok");
+      await refreshSsmTunnelState();
+    } catch (e) {
+      alert("Could not stop all sessions: " + e);
+    } finally {
+      if (ssmStopAllBtn) {
+        ssmStopAllBtn.disabled = false;
+        ssmStopAllBtn.textContent = "Stop All";
+      }
+    }
+  }
+
+  async function stopSsmTunnel(tunnelId){
+    if (!confirm("Stop this SSM session/tunnel?")) return;
+    const r = await fetch("/api/ssm/stop-tunnel", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({tunnel_id:tunnelId})
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) alert(data.message || "Could not stop tunnel");
+    await refreshSsmTunnelState();
+  }
+
+  if (ssmSessionToggleBtn) {
+    ssmSessionToggleBtn.addEventListener("click", () => {
+      ssmSessionWidget.classList.toggle("expanded");
+      ssmSessionToggleBtn.textContent = ssmSessionWidget.classList.contains("expanded") ? "Close" : "Open";
+    });
+  }
+  if (ssmKeepAliveNowBtn) ssmKeepAliveNowBtn.addEventListener("click", () => sendSsmKeepAlive(true));
+  if (ssmStopAllBtn) ssmStopAllBtn.addEventListener("click", stopAllSsmTunnels);
+  if (ssmSessionRefreshBtn) ssmSessionRefreshBtn.addEventListener("click", refreshSsmTunnelState);
+  if (ssmSessionHideBtn) {
+    ssmSessionHideBtn.addEventListener("click", () => {
+      ssmWidgetHidden = true;
+      ssmSessionWidget.style.display = "none";
+    });
+  }
+  if (ssmSessionList) {
+    ssmSessionList.addEventListener("click", async (e) => {
+      const copy = e.target.getAttribute("data-copy");
+      const keep = e.target.getAttribute("data-keepalive");
+      const restartBtn = e.target.closest("[data-restart]");
+      if (restartBtn) {
+        const id = restartBtn.dataset.restart;
+        if (!confirm("Restart this tunnel? Existing SSM process will be stopped and recreated.")) return;
+
+        restartBtn.disabled = true;
+        restartBtn.textContent = "Restarting...";
+
+        try {
+          const r = await fetch("/api/ssm/restart-tunnel", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({tunnel_id:id})
+          });
+          const data = await r.json();
+
+          if (!data.ok) {
+            alert(data.message || "Restart failed.");
+          }
+
+          setTimeout(refreshSsmTunnelState, 1200);
+          showAtlasToast(data.ok ? "Tunnel restart requested" : (data.message || "Restart failed"), data.ok ? "ok" : "bad");
+        } catch (err) {
+          alert("Restart failed: " + err);
+        }
+
+        return;
+      }    
+      const stop = e.target.getAttribute("data-stop");
+      if (copy) {
+        await navigator.clipboard.writeText(copy).catch(() => {});
+        if (ssmSessionText) ssmSessionText.innerHTML = `<span class="ssm-idle-ok">Copied</span>: ${escHtml(copy)}`;
+      }
+      if (keep) sendSsmKeepAlive(true, keep);
+      if (stop) stopSsmTunnel(stop);
+    });
+  }
+  function openConnectionStatusPopup() {
+    ssmWidgetHidden = false;
+
+    if (ssmSessionWidget) {
+      ssmSessionWidget.style.display = "block";
+      ssmSessionWidget.classList.add("expanded");
+    }
+
+    if (ssmSessionToggleBtn) {
+      ssmSessionToggleBtn.textContent = "Close";
+    }
+
+    refreshSsmTunnelState();
+  }
+
+  if (btnConnectionStatus) {
+    btnConnectionStatus.addEventListener("click", openConnectionStatusPopup);
+  }
+
+  const btnDiagnostics = document.getElementById("btnDiagnostics");
+  const diagnosticsOutput = document.getElementById("diagnosticsOutput");
+  const diagnosticsStatus = document.getElementById("diagnosticsStatus");
+  const btnCopyDiagnostics = document.getElementById("btnCopyDiagnostics");
+  const btnRefreshDiagnostics = document.getElementById("btnRefreshDiagnostics");
+
+  function diagnosticsToText(d) {
+    const state = (v) => v ? "OK" : "NOT FOUND";
+    return [
+      `ATLAS Version       : ${d.app?.version || "2.0.0"}`,
+      `Profile             : ${d.profile || "-"}`,
+      `Region              : ${d.region || "-"}`,
+      `AWS Account         : ${d.account_id || "-"}`,
+      `Caller ARN          : ${d.caller_arn || "-"}`,
+      `AWS Authentication  : ${d.auth_message || "-"}`,
+      ``,
+      `AWS CLI             : ${state(d.aws_cli?.ok)} | ${d.aws_cli?.version || "-"}`,
+      `Session Manager     : ${state(d.session_manager_plugin?.ok)} | ${d.session_manager_plugin?.version || "-"}`,
+      ``,
+      `Catalog Status      : ${d.catalog?.status || "-"}`,
+      `Catalog Age         : ${d.catalog?.age_text || "-"}`,
+      `Last Refresh UTC    : ${d.catalog?.last_refresh_utc || "-"}`,
+      `Database Targets    : ${d.counts?.database ?? 0}`,
+      `Web UI Targets      : ${d.counts?.web ?? 0}`,
+      `EC2/Shell Targets   : ${d.counts?.ec2_shell ?? 0}`,
+      `Total Targets       : ${d.counts?.total ?? 0}`,
+      `Tracked Tunnels     : ${d.active_tunnels ?? 0}`,
+      ``,
+      `App Data            : ${d.paths?.app_data || "-"}`,
+      `Catalog DB          : ${d.paths?.catalog_db || "-"}`,
+      `Catalog JSON        : ${d.paths?.catalog_json || "-"}`,
+      `Tunnel State        : ${d.paths?.active_tunnels || "-"}`,
+      `Logs                : ${d.paths?.logs || "-"}`
+    ].join("\n");
+  }
+
+  async function loadDiagnostics() {
+    if (diagnosticsStatus) diagnosticsStatus.textContent = "Running checks...";
+    if (diagnosticsOutput) diagnosticsOutput.textContent = "Loading...";
+    try {
+      const r = await fetch(`/api/diagnostics?profile=${encodeURIComponent(ssmProfile)}&region=${encodeURIComponent(ssmRegion)}`);
+      const d = await r.json();
+      if (!r.ok || d.ok === false) throw new Error(d.message || "Diagnostics failed");
+      if (diagnosticsOutput) diagnosticsOutput.textContent = diagnosticsToText(d);
+      if (diagnosticsStatus) diagnosticsStatus.textContent = "Diagnostics completed.";
+    } catch (e) {
+      if (diagnosticsOutput) diagnosticsOutput.textContent = String(e);
+      if (diagnosticsStatus) diagnosticsStatus.textContent = "Diagnostics failed.";
+    }
+  }
+
+  if (btnDiagnostics) {
+    btnDiagnostics.addEventListener("click", async () => {
+      const el = document.getElementById("diagnosticsModal");
+      if (el && window.bootstrap) bootstrap.Modal.getOrCreateInstance(el).show();
+      await loadDiagnostics();
+    });
+  }
+  if (btnRefreshDiagnostics) btnRefreshDiagnostics.addEventListener("click", loadDiagnostics);
+  if (btnCopyDiagnostics) {
+    btnCopyDiagnostics.addEventListener("click", async () => {
+      const text = diagnosticsOutput?.textContent || "";
+      await navigator.clipboard.writeText(text).catch(() => {});
+      showAtlasToast("Diagnostics copied", "ok");
+    });
+  }
+
+  setInterval(refreshSsmTunnelState, 60000);
+  
+  {% endif %}
+
+
+</script>
+</body>
+</html>
