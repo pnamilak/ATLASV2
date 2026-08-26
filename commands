@@ -23,3 +23,8 @@ split -b 20m \
     ATLAS-V2.0-Mac-Build.zip.part-
 
 ls -lh ATLAS-V2.0-Mac-Build.zip.part-*
+
+cd ~/projects/ATLASV2
+git pull
+chmod +x ATLAS_Mac_Full_Setup_and_Build.sh
+./ATLAS_Mac_Full_Setup_and_Build.sh
