@@ -1113,6 +1113,89 @@ def aws_cli_json(profile: str, region: str, service_args: List[str], log_cb) -> 
         raise RuntimeError(f"Failed to parse AWS JSON: {e}\nRaw:\n{out[:2000]}")
 
 
+
+def is_aws_permission_denied_text(text: str) -> bool:
+    """
+    Return True only for authorization/permission failures.
+    """
+    t = (text or "").lower()
+    patterns = [
+        "accessdenied",
+        "access denied",
+        "accessdeniedexception",
+        "unauthorizedoperation",
+        "not authorized to perform",
+        "is not authorized to perform",
+        "not authorized for",
+        "explicit deny",
+        "because no identity-based policy allows",
+        "because no resource-based policy allows",
+    ]
+    return any(p in t for p in patterns)
+
+
+def aws_cli_json_optional(
+    profile: str,
+    region: str,
+    service_args: List[str],
+    log_cb,
+    default: Optional[Any] = None,
+) -> Any:
+    """
+    Run one AWS discovery command without making the entire catalog depend on
+    permission for that API.
+    """
+    if default is None:
+        default = {}
+
+    cmd = aws_cmd_base() + service_args + [
+        "--profile", profile,
+        "--region", region,
+        "--output", "json",
+    ]
+
+    service_label = " ".join(service_args[:2]) if service_args else "AWS discovery"
+    log_cb(f"$ {' '.join(shlex.quote(x) for x in cmd)}\n")
+
+    code, out, err = run_cmd(cmd)
+
+    if code != 0:
+        msg = _aws_error_text(out, err)
+
+        if is_sso_session_expired_text(msg):
+            raise SsoSessionExpiredError(
+                "SSO session expired for profile: " + profile +
+                "\n\nGo to Profiles, click SSO Login for this profile, and retry the action.\n\n" +
+                msg
+            )
+
+        if is_aws_permission_denied_text(msg):
+            log_cb(
+                f"SKIPPED {service_label}: profile '{profile}' does not have permission "
+                f"for this API. Continuing with other authorized inventory sources.\n"
+            )
+            return default
+
+        compact = " ".join((msg or f"AWS CLI exit code {code}").split())
+        if len(compact) > 700:
+            compact = compact[:700] + "..."
+
+        log_cb(
+            f"SKIPPED {service_label}: AWS CLI returned an error. "
+            f"Continuing with other inventory sources. Error: {compact}\n"
+        )
+        return default
+
+    try:
+        return json.loads(out or "{}")
+    except Exception as e:
+        log_cb(
+            f"SKIPPED {service_label}: unable to parse AWS JSON ({e}). "
+            f"Continuing with other inventory sources.\n"
+        )
+        return default
+
+
 def classify_ec2_platform(inst: Dict[str, Any]) -> str:
     plat = (inst.get("Platform") or "").lower()
     details = (inst.get("PlatformDetails") or "").lower()
@@ -1537,7 +1620,12 @@ def build_inventory(profile: str, region: str, log_cb) -> Dict[str, Any]:
         except Exception:
             pass
 
-    ec2 = aws_cli_json(profile, region, ["ec2", "describe-instances"], log_cb)
+    ec2 = aws_cli_json_optional(
+        profile, region,
+        ["ec2", "describe-instances"],
+        log_cb,
+        default={"Reservations": []},
+    )
     seen_ec2 = set()
     for res in ec2.get("Reservations", []):
         for inst in res.get("Instances", []):
@@ -1603,7 +1691,12 @@ def build_inventory(profile: str, region: str, log_cb) -> Dict[str, Any]:
     except Exception as e:
         log_cb(f"Route53 ELB target mapping skipped: {e}\n")
 
-    clu = aws_cli_json(profile, region, ["rds", "describe-db-clusters"], log_cb)
+    clu = aws_cli_json_optional(
+        profile, region,
+        ["rds", "describe-db-clusters"],
+        log_cb,
+        default={"DBClusters": []},
+    )
     seen_clu = set()
     for c in clu.get("DBClusters", []):
         cid = c.get("DBClusterIdentifier")
@@ -1643,7 +1736,12 @@ def build_inventory(profile: str, region: str, log_cb) -> Dict[str, Any]:
             }
         )
 
-    rds = aws_cli_json(profile, region, ["rds", "describe-db-instances"], log_cb)
+    rds = aws_cli_json_optional(
+        profile, region,
+        ["rds", "describe-db-instances"],
+        log_cb,
+        default={"DBInstances": []},
+    )
     seen_rds = set()
     for db in rds.get("DBInstances", []):
         dbid = db.get("DBInstanceIdentifier")
@@ -1696,7 +1794,12 @@ def build_inventory(profile: str, region: str, log_cb) -> Dict[str, Any]:
 
     # DocDB
     try:
-        doc = aws_cli_json(profile, region, ["docdb", "describe-db-clusters"], log_cb)
+        doc = aws_cli_json_optional(
+            profile, region,
+            ["docdb", "describe-db-clusters"],
+            log_cb,
+            default={"DBClusters": []},
+        )
         seen_doc = set()
         doc_map: Dict[str, Dict[str, Any]] = {}
 
@@ -1736,7 +1839,12 @@ def build_inventory(profile: str, region: str, log_cb) -> Dict[str, Any]:
             doc_map[cid] = rec
 
         try:
-            inst = aws_cli_json(profile, region, ["docdb", "describe-db-instances"], log_cb)
+            inst = aws_cli_json_optional(
+                profile, region,
+                ["docdb", "describe-db-instances"],
+                log_cb,
+                default={"DBInstances": []},
+            )
             for d in inst.get("DBInstances", []):
                 dbid = d.get("DBInstanceIdentifier")
                 clid = d.get("DBClusterIdentifier")
